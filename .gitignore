@@ -1,3 +1,44 @@
+# ========================================================
+# SocketFileShare's gitignore
+# ========================================================
+
+# Server storage directory (runtime data, uploaded files)
+server_storage/
+
+# Performance logs / Analysis outputs
+analysis/*.csv
+analysis/*.json
+analysis/*.log
+analysis/*.txt
+
+# Temporary test files / Transferred sample data
+uploads/
+downloads/
+temp/
+*.tmp
+*.bak
+
+# Socket debug / Error logs
+*.log
+logs/
+
+# Local configuration / credentials
+config.json
+secrets.json
+
+# Archive artifacts
+*.tar
+*.gz
+*.zip
+
+# System-specific hidden files
+.DS_Store
+Thumbs.db
+
+# ========================================================
+# GitHub's Standard Python gitignore
+# ========================================================
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

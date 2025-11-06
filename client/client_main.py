@@ -1,9 +1,10 @@
 # client/client_main.py
-# Runs client connection and session.
+# Runs the client connection and command session.
 
 import socket
 import sys
-from .commands import ClientSession
+from commands import ClientSession
+from analysis.performance_eval import PerfRecorder, timed  # For timing and metric tracking
 
 #### Constants ####
 USAGE = (
@@ -46,8 +47,10 @@ def _prompt_server_target():
 #### Command Dispatch ####
 def _dispatch(session, line):
     """
-    Parse a user input line and execute the corresponding ClientSession method.
-    Return False to terminate the loop; True to continue.
+    Parse user input and execute the corresponding ClientSession method.
+    Returns False to terminate the loop; True to continue.
+
+    Placeholder: future command validation and progress feedback can be added here.
     """
     if not line:
         return True
@@ -65,7 +68,7 @@ def _dispatch(session, line):
         print(USAGE)
         return True
 
-    # Authentication
+    # Authentication command
     if cmd == "auth":
         if len(parts) == 3:
             session.auth(parts[1], parts[2])
@@ -105,7 +108,7 @@ def _dispatch(session, line):
             print("Use: dir")
         return True
 
-    # Subfolder creation/deletion
+    # Subfolder create/delete
     if cmd == "subfolder":
         if len(parts) >= 3:
             action = parts[1].lower()
@@ -120,16 +123,21 @@ def _dispatch(session, line):
 
 #### Main Entry Point ####
 def main():
-    """Main entry point for the client."""
+    """Main entry point for the client program."""
     server_ip, server_port = _prompt_server_target()
 
+    # Create performance recorder (local per session)
+    perf = PerfRecorder()
+
+    # Initialize client session
     session = ClientSession(server_ip, server_port)
+    timer = timed()  # Track session duration
     session.connect()
 
-    # Return to launcher if connection failed
+    # Return to launcher if connection fails
     if not session.connected:
         print("[x] Could not establish connection. Returning to main menu.\n")
-        return False  # Indicate failure
+        return False
 
     print("Connected. Type 'help' for commands. Type 'quit' to exit.\n")
 
@@ -141,18 +149,27 @@ def main():
             except EOFError:
                 line = "quit"
             except KeyboardInterrupt:
-                print("\nInterrupted.")
+                print("\n[i] Interrupted.")
                 line = "quit"
 
             try:
                 keep_running = _dispatch(session, line)
             except (socket.error, OSError) as e:
                 print(f"Network error: {e}")
+                # Placeholder: add reconnection and retry handling if needed.
                 keep_running = True
+
             if not keep_running:
                 break
-    finally:
-        session.close()
-        print("Disconnected from server.\n")
 
-    return True # Indicate normal exit
+    finally:
+        elapsed = timer()
+        perf.record_response(operation="client_session", seconds=elapsed)
+        session.close()
+        print(f"Disconnected from server. Session duration: {elapsed:.2f}s\n")
+
+    return True  # Indicate normal exit for main.py
+
+#### Run as Script ####
+if __name__ == "__main__":
+    main()
