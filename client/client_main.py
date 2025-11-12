@@ -3,7 +3,7 @@
 
 import socket
 import sys
-from commands import ClientSession
+from client.commands import ClientSession
 from analysis.performance_eval import PerfRecorder, timed  # For timing and metric tracking
 
 #### Constants ####
