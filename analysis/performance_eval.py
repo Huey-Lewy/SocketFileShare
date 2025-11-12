@@ -44,7 +44,7 @@ class PerfRecorder:
                 "seconds": float(seconds),
                 "rate_MBps": float(rate) if rate is not None else None,
             })
-        # Placeholder: integrate with client/server upload/download timing.
+        # Placeholder: integrate with client/server upload/download timings.
 
     def record_response(self, *, operation, seconds):
         """
