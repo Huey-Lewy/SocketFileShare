@@ -5,6 +5,7 @@ import hashlib      # password key derivation
 import json         # user database storage
 import os           # filesystem paths and files
 import threading    # user DB and key file locking
+import hmac         # constant-time compare
 from cryptography.fernet import Fernet, InvalidToken    # encrypted auth payloads
 
 #### Constants ####
@@ -35,6 +36,14 @@ def ensure_user_db():
             print("[auth] Creating new user database:", USER_DB)
             with open(USER_DB, "w", encoding=ENCODING) as db:
                 json.dump({}, db)
+
+def init_auth_store():
+    """
+    Initialize authentication-related storage so that
+    the user DB and secret key files exist.
+    """
+    ensure_user_db()
+    _load_or_create_secret_key()
 
 def _load_user_db():
     """
@@ -243,7 +252,8 @@ def verify_password(password, salt_hex, stored_hash_hex):
         print("[auth] Invalid salt in user DB")
         return False
     computed_hash = _derive_password_hash(password, salt)
-    return hashlib.compare_digest(computed_hash, stored_hash_hex)
+    # Use constant-time comparison to reduce timing side channels.
+    return hmac.compare_digest(computed_hash, stored_hash_hex)
 
 #### User Management ####
 def register_user(username, password, role=ROLE_USER, overwrite=False):

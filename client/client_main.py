@@ -10,7 +10,6 @@ from analysis.performance_eval import PerfRecorder, timed       # session metric
 #### Constants ####
 USAGE = (
     "Commands:\n"
-    "  auth [username] [password]        Re-authenticate or switch user\n"
     "  passwd                            Change your password\n"
     "  upload <local_path> [remote]      Upload a file (stub)\n"
     "  download <remote> [local]         Download a file (stub)\n"
@@ -22,6 +21,7 @@ USAGE = (
     "  admin-setrole <user> <role>       Change a user's role (admin)\n"
     "  admin-resetpass <user>            Reset a user's password (admin)\n"
     "  admin-listusers                   List users (admin)\n"
+    "  logout                            Logout and re-login\n"
     "  help                              Show this help\n"
     "  quit / exit                       Logout and exit\n"
 )
@@ -60,6 +60,13 @@ def _initial_auth(session):
         pass: <password hidden>
     """
     while True:
+        if not session.connected:
+            print("[i] Connecting to server...")
+            session.connect()
+            if not session.connected:
+                print("[x] Could not connect to server.")
+                return False
+
         print("--- Login ---")
         username = input("user: ").strip()
         if not username:
@@ -75,28 +82,7 @@ def _initial_auth(session):
         if choice not in ("y", "yes"):
             return False
 
-#### Command Dispatch ####
-def _handle_auth(session, parts):
-    """
-    Handle 'auth' command for re-auth or user switch.
-
-    Variants:
-        auth
-        auth <username>
-        auth <username> <password>
-    """
-    if len(parts) == 1:
-        username = input("Username: ").strip()
-        password = getpass.getpass("Password: ")
-    elif len(parts) == 2:
-        username = parts[1]
-        password = getpass.getpass("Password: ")
-    else:
-        username = parts[1]
-        password = parts[2]
-
-    session.auth(username, password)
-
+#### Command handlers ####
 def _handle_passwd(session):
     """
     Handle 'passwd' command for changing your password.
@@ -166,9 +152,27 @@ def _handle_admin_resetpass(session, parts):
         return
     session.admin_resetpass(username, new_pwd)
 
+def _handle_logout(session):
+    """
+    Handle 'logout' command.
+
+    Steps:
+      - Send LOGOUT and close current connection.
+      - Prompt for a new username/password and attempt re-auth.
+      - Return True to keep the client running, False to exit.
+    """
+    session.logout()
+    print("")
+    if _initial_auth(session):
+        print("Re-authenticated. Type 'help' for commands. Type 'quit' to exit.\n")
+        return True
+
+    print("[i] Logout complete. No new authentication requested.")
+    return False
+
 def _dispatch(session, line):
     """
-    Parse user input and run the matching ClientSession method.
+    Parse user input and execute the corresponding ClientSession method.
     Returns False to terminate the loop; True to continue.
     """
     if not line:
@@ -177,19 +181,18 @@ def _dispatch(session, line):
     parts = line.split()
     cmd = parts[0].lower()
 
-    # Exit / logout
-    if cmd in ("quit", "exit", "logout"):
+    # Quit / exit: logout and exit client
+    if cmd in ("quit", "exit"):
         session.logout()
         return False
+
+    # Logout: close current session, then re-login
+    if cmd == "logout":
+        return _handle_logout(session)
 
     # Help
     if cmd == "help":
         print(USAGE)
-        return True
-
-    # Auth (re-auth / switch user)
-    if cmd == "auth":
-        _handle_auth(session, parts)
         return True
 
     # Change password
@@ -277,11 +280,13 @@ def main():
     session = ClientSession(server_ip, server_port)
     timer = timed()  # Track session duration
 
-    if not session.connect():
+    # Connect once; _initial_auth will reconnect if connection drops later
+    session.connect()
+    if not session.connected:
         print("[x] Could not establish connection. Returning to main menu.\n")
         return False
 
-    # Initial login (SSH-style)
+    # Initial login
     if not _initial_auth(session):
         session.close()
         print("[x] Authentication failed. Returning to main menu.\n")
@@ -289,7 +294,7 @@ def main():
         perf.record_response(operation="client_session", seconds=elapsed, source="client")
         return False
 
-    print("Connected and authenticated. Type 'help' for commands. Type 'quit' to exit.\n")
+    print("Connected and authenticated. Type 'help' for commands.\n")
 
     # Interactive loop
     try:

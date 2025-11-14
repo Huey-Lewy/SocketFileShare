@@ -428,6 +428,9 @@ def handle_client(conn, addr):
 #### Main Entry Point ####
 def main():
     """Main entry point for the server."""
+    # Initialize auth store so that user DB and secret key exist
+    auth.init_auth_store()
+
     config = _prompt_server_config()
     if not config:
         print("[x] Invalid server configuration. Returning to main menu.\n")
