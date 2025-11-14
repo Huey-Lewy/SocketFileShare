@@ -1,43 +1,116 @@
 # client/commands.py
 # Processes user input and client commands.
 
-import os
-import socket
-import sys
-import threading
-import time
-from analysis.performance_eval import PerfRecorder, timed  # For timing and metric recording
+import os           # local file paths
+import socket       # TCP client socket
+import threading    # sync reads and writes
+import json         # auth/admin payload encoding
+from cryptography.fernet import Fernet                          # encrypt auth and admin payloads
+from analysis.performance_eval import PerfRecorder, timed       # client-side metrics
 
 #### Constants ####
-BUFFER = 64 * 1024  # 64KB buffer size for file transfer
-ENC = 'utf-8'       # Encoding format for strings
-LINE_END = b"\n"    # Line ending byte sequence
+BUFFER = 64 * 1024   # 64KB buffer size for file transfer
+ENC = "utf-8"        # Encoding format for strings
+LINE_END = b"\n"     # Line ending byte sequence
+CLIENT_SECRET_KEY_FILE = "auth_secret.key"  # Must match server's key file
 
+#### Encryption helpers ####
+def _load_shared_key():
+    """
+    Load the shared encryption key used for auth-related payloads.
+
+    The same key file must be present on server and client hosts.
+    """
+    if not os.path.exists(CLIENT_SECRET_KEY_FILE):
+        print(f"[auth] Shared key file '{CLIENT_SECRET_KEY_FILE}' not found.")
+        print("[auth] Copy this key file from the server host before running the client.")
+        return None
+
+    with open(CLIENT_SECRET_KEY_FILE, "rb") as f:
+        key = f.read().strip()
+
+    if not key:
+        print("[auth] Shared key file is empty.")
+        return None
+
+    return key
+
+def _get_cipher():
+    """
+    Create a Fernet cipher instance using the shared key.
+
+    Returns:
+        Fernet or None: Cipher object or None if key is unavailable.
+    """
+    key = _load_shared_key()
+    if key is None:
+        return None
+
+    try:
+        return Fernet(key)
+    except Exception as exc:
+        print(f"[auth] Could not create cipher: {exc}")
+        return None
+
+def encrypt_payload(payload_dict):
+    """
+    Encrypt a small JSON payload for transit.
+
+    Parameters:
+        payload_dict (dict): Data to encode and encrypt.
+
+    Returns:
+        str or None: Base64 text token, or None on error.
+    """
+    cipher = _get_cipher()
+    if cipher is None:
+        return None
+
+    try:
+        raw = json.dumps(payload_dict).encode(ENC)
+        token = cipher.encrypt(raw)
+        return token.decode(ENC)
+    except Exception as exc:
+        print(f"[auth] Encryption failed: {exc}")
+        return None
+
+#### Client session ####
 class ClientSession:
     def __init__(self, ip, port):
-        self.addr = (ip, port)              # Tuple holding server address and port
-        self.sock = None                    # Active socket connection to the server
-        self._recv_lock = threading.Lock()  # Prevent overlapping reads from socket
-        self._send_lock = threading.Lock()  # Prevent overlapping writes to socket
-        self.connected = False              # Connection status flag
-        self.transfer_times = []            # Stores timing/speed metrics for uploads/downloads
-        self.perf = PerfRecorder()          # Local performance recorder instance
+        self.addr = (ip, port)              # Server (ip, port)
+        self.sock = None                    # Active socket
+        self._recv_lock = threading.Lock()  # Serialize reads
+        self._send_lock = threading.Lock()  # Serialize writes
+        self.connected = False              # TCP connection flag
+        self.username = None                # Authenticated username
+        self.user_id = None                 # Server-assigned user id
+        self.role = None                    # 'user' or 'admin'
+        self.authenticated = False          # Auth status
+        self.perf = PerfRecorder()          # Local performance recorder
 
     #### Basic Helpers ####
     def _sendline(self, line):
-        """Encode and send a single line terminated with newline."""
+        """
+        Encode and send a single line terminated with newline.
+        """
         if not self.sock:
             print("[!] No active connection.")
             return
-        data = (line + "\n").encode(ENC)
+        data = (line.rstrip("\n") + "\n").encode(ENC)
         with self._send_lock:
             self.sock.sendall(data)
-        # Placeholder: add logging and encryption before sending.
+        # Placeholder: add client-side logging of outbound commands.
 
     def _readline(self):
-        """Read a single newline-terminated line; return decoded str without newline."""
+        """
+        Read a single newline-terminated line; return decoded str without newline.
+
+        Returns:
+            str or None: Line text or None on EOF.
+        """
         if not self.sock:
             return None
+
         buf = bytearray()
         with self._recv_lock:
             while True:
@@ -47,48 +120,62 @@ class ClientSession:
                 buf += ch
                 if ch == LINE_END:
                     break
+
         if not buf:
             return None
+
         return buf[:-1].decode(ENC, errors="replace")
-        # Placeholder: may add timeout and protocol-level framing later.
+        # Placeholder: add timeout handling and more robust framing if needed.
 
     #### Connection Lifecycle ####
     def connect(self):
-        """Attempt to connect to the server; handle connection errors gracefully."""
+        """
+        Open a TCP connection to the server address.
+
+        Returns:
+            bool: True on success, False on failure.
+        """
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             print(f"[+] Connecting to {self.addr[0]}:{self.addr[1]} ...")
             self.sock.connect(self.addr)
             self.sock.settimeout(5)
             self.connected = True
-            print("[✓] Connection established.\n")
+            print("[i] TCP connection established.\n")
+            return True
         except ConnectionRefusedError:
             print(f"[x] Connection refused. No server listening at {self.addr}.")
-            self.close()
         except socket.timeout:
-            print(f"[x] Connection timed out.")
-            self.close()
+            print("[x] Connection timed out.")
         except OSError as e:
             print(f"[x] Connection error: {e}")
-            self.close()
-        # Placeholder: consider authentication handshake immediately after connecting.
+
+        self.close()
+        return False
 
     def logout(self):
-        """Send logout command and close the connection."""
+        """
+        Send logout command and close the connection.
+        """
         if not self.connected or not self.sock:
             print("[!] Not connected to a server.")
             return
         try:
             self._sendline("LOGOUT")
-            print("[i] Logout request sent.")
+            resp = self._readline()
+            if resp is None:
+                print("[i] Logout request sent (no response).")
+            else:
+                print(f"[server] {resp}")
         except (OSError, socket.error) as e:
             print(f"[x] Error sending logout: {e}")
         finally:
             self.close()
-        # Placeholder: add logout confirmation handling if required.
 
     def close(self):
-        """Safely close the socket connection."""
+        """
+        Safely close the socket connection.
+        """
         if self.sock:
             try:
                 self.sock.close()
@@ -97,123 +184,451 @@ class ClientSession:
                 pass
         self.sock = None
         self.connected = False
-        # Placeholder: collect and summarize session metrics via self.perf.snapshot().
+        self.authenticated = False
+        self.username = None
+        self.user_id = None
+        self.role = None
+        # Placeholder: dump or summarize client-side metrics using self.perf.snapshot().
 
-    #### Commands ####
+    #### Authentication and account commands ####
     def auth(self, username, password):
         """
-        Handle user authentication.
-        Sends credentials to the server for verification.
+        Authenticate user with the server.
 
-        Parameters:
-            username (str): Client's username
-            password (str): Client's password
+        Protocol:
+            AUTH <token>
+
+        Where <token> is an encrypted JSON payload:
+            {
+                "op": "login",
+                "username": "...",
+                "password": "..."
+            }
         """
-        print("[!] Authentication not implemented yet.")
-        timer = timed()
-        self._sendline(f"AUTH {username} {password}")
-        # Placeholder: implement encryption and hashing before sending credentials.
-        # Placeholder: wait for and process server authentication response.
-        # Record response time
-        duration = timer()
-        self.perf.record_response(operation="auth", seconds=duration)
-        # Placeholder: log auth latency for performance analysis.
+        if not self.connected or not self.sock:
+            print("[!] Not connected; cannot authenticate.")
+            return False
 
-    def dir_list(self):
+        payload = {
+            "op": "login",
+            "username": username,
+            "password": password,
+        }
+
+        token = encrypt_payload(payload)
+        if token is None:
+            print("[x] Could not build encrypted auth payload.")
+            return False
+
+        timer = timed()
+        self._sendline(f"AUTH {token}")
+        resp = self._readline()
+        duration = timer()
+        self.perf.record_response(operation="auth", seconds=duration, source="client")
+
+        if resp is None:
+            print("[x] No response from server during auth.")
+            self.close()
+            return False
+
+        parts = resp.split()
+        if len(parts) >= 2 and parts[0] == "OK" and parts[1] == "AUTH":
+            # Expected format: OK AUTH role=<role> user_id=<user_id>
+            role = None
+            user_id = None
+            for piece in parts[2:]:
+                if piece.startswith("role="):
+                    role = piece.split("=", 1)[1]
+                elif piece.startswith("user_id="):
+                    user_id = piece.split("=", 1)[1]
+
+            self.username = username
+            self.role = role
+            self.user_id = user_id
+            self.authenticated = True
+            print(f"[i] Authenticated as '{self.username}' (role={self.role}, id={self.user_id}).")
+            return True
+
+        if len(parts) >= 2 and parts[0] == "ERR" and parts[1] == "AUTH":
+            reason = " ".join(parts[2:]) if len(parts) > 2 else "unknown error"
+            print(f"[x] Authentication failed: {reason}")
+        else:
+            print(f"[x] Unexpected auth response: {resp}")
+
+        self.close()
+        return False
+
+    def change_password(self, old_password, new_password):
+        """
+        Change password for the current user.
+
+        Protocol:
+            PASSWD <token>
+
+        Where <token> is an encrypted JSON payload:
+            {
+                "op": "passwd",
+                "old_password": "...",
+                "new_password": "..."
+            }
+        """
+        if not self.authenticated:
+            print("[!] You must authenticate before changing password.")
+            return
+
+        payload = {
+            "op": "passwd",
+            "old_password": old_password,
+            "new_password": new_password,
+        }
+
+        token = encrypt_payload(payload)
+        if token is None:
+            print("[x] Could not build encrypted password payload.")
+            return
+
+        timer = timed()
+        self._sendline(f"PASSWD {token}")
+        resp = self._readline()
+        duration = timer()
+        self.perf.record_response(operation="passwd", seconds=duration, source="client")
+
+        if resp is None:
+            print("[x] No response for PASSWD command.")
+            return
+
+        parts = resp.split()
+        if len(parts) >= 2 and parts[0] == "OK" and parts[1] == "PASSWD":
+            print("[i] Password changed.")
+        elif len(parts) >= 2 and parts[0] == "ERR" and parts[1] == "PASSWD":
+            reason = " ".join(parts[2:]) if len(parts) > 2 else "unknown error"
+            print(f"[x] PASSWD failed: {reason}")
+        else:
+            print(f"[x] Unexpected PASSWD response: {resp}")
+
+    #### Admin commands ####
+    def _check_admin(self, cmd_name):
+        if self.role != "admin":
+            print(f"[!] {cmd_name} denied: not logged in as admin.")
+            return False
+        if not self.authenticated:
+            print(f"[!] {cmd_name} denied: not authenticated.")
+            return False
+        return True
+
+    def admin_adduser(self, username, role, password):
+        """
+        Admin: add a new user.
+
+        Protocol:
+            ADMIN ADDUSER <username> <role> <token>
+        """
+        if not self._check_admin("ADMIN ADDUSER"):
+            return
+
+        payload = {
+            "op": "adduser",
+            "password": password,
+        }
+        token = encrypt_payload(payload)
+        if token is None:
+            print("[x] Could not build encrypted ADDUSER payload.")
+            return
+
+        line = f"ADMIN ADDUSER {username} {role} {token}"
+        timer = timed()
+        self._sendline(line)
+        resp = self._readline()
+        duration = timer()
+        self.perf.record_response(operation="admin_adduser", seconds=duration, source="client")
+
+        if resp is None:
+            print("[x] No response for ADMIN ADDUSER.")
+            return
+
+        parts = resp.split()
+        if len(parts) >= 3 and parts[0] == "OK" and parts[1] == "ADMIN" and parts[2] == "ADDUSER":
+            print(f"[i] Added user '{username}' with role '{role}'.")
+        elif len(parts) >= 2 and parts[0] == "ERR" and parts[1] == "ADMIN":
+            reason = " ".join(parts[2:]) if len(parts) > 2 else "unknown error"
+            print(f"[x] ADMIN ADDUSER failed: {reason}")
+        else:
+            print(f"[x] Unexpected ADMIN ADDUSER response: {resp}")
+
+    def admin_deluser(self, username):
+        """
+        Admin: delete an existing user.
+
+        Protocol:
+            ADMIN DELUSER <username>
+        """
+        if not self._check_admin("ADMIN DELUSER"):
+            return
+
+        line = f"ADMIN DELUSER {username}"
+        timer = timed()
+        self._sendline(line)
+        resp = self._readline()
+        duration = timer()
+        self.perf.record_response(operation="admin_deluser", seconds=duration, source="client")
+
+        if resp is None:
+            print("[x] No response for ADMIN DELUSER.")
+            return
+
+        parts = resp.split()
+        if len(parts) >= 3 and parts[0] == "OK" and parts[1] == "ADMIN" and parts[2] == "DELUSER":
+            print(f"[i] Deleted user '{username}'.")
+        elif len(parts) >= 2 and parts[0] == "ERR" and parts[1] == "ADMIN":
+            reason = " ".join(parts[2:]) if len(parts) > 2 else "unknown error"
+            print(f"[x] ADMIN DELUSER failed: {reason}")
+        else:
+            print(f"[x] Unexpected ADMIN DELUSER response: {resp}")
+
+    def admin_setrole(self, username, role):
+        """
+        Admin: change a user's role.
+
+        Protocol:
+            ADMIN SETROLE <username> <role>
+        """
+        if not self._check_admin("ADMIN SETROLE"):
+            return
+
+        line = f"ADMIN SETROLE {username} {role}"
+        timer = timed()
+        self._sendline(line)
+        resp = self._readline()
+        duration = timer()
+        self.perf.record_response(operation="admin_setrole", seconds=duration, source="client")
+
+        if resp is None:
+            print("[x] No response for ADMIN SETROLE.")
+            return
+
+        parts = resp.split()
+        if len(parts) >= 4 and parts[0] == "OK" and parts[1] == "ADMIN" and parts[2] == "SETROLE":
+            print(f"[i] Set role for '{username}' to '{role}'.")
+        elif len(parts) >= 2 and parts[0] == "ERR" and parts[1] == "ADMIN":
+            reason = " ".join(parts[2:]) if len(parts) > 2 else "unknown error"
+            print(f"[x] ADMIN SETROLE failed: {reason}")
+        else:
+            print(f"[x] Unexpected ADMIN SETROLE response: {resp}")
+
+    def admin_resetpass(self, username, new_password):
+        """
+        Admin: reset a user's password.
+
+        Protocol:
+            ADMIN RESETPASS <username> <token>
+        """
+        if not self._check_admin("ADMIN RESETPASS"):
+            return
+
+        payload = {
+            "op": "resetpass",
+            "new_password": new_password,
+        }
+        token = encrypt_payload(payload)
+        if token is None:
+            print("[x] Could not build encrypted RESETPASS payload.")
+            return
+
+        line = f"ADMIN RESETPASS {username} {token}"
+        timer = timed()
+        self._sendline(line)
+        resp = self._readline()
+        duration = timer()
+        self.perf.record_response(operation="admin_resetpass", seconds=duration, source="client")
+
+        if resp is None:
+            print("[x] No response for ADMIN RESETPASS.")
+            return
+
+        parts = resp.split()
+        if len(parts) >= 3 and parts[0] == "OK" and parts[1] == "ADMIN" and parts[2] == "RESETPASS":
+            print(f"[i] Reset password for '{username}'.")
+        elif len(parts) >= 2 and parts[0] == "ERR" and parts[1] == "ADMIN":
+            reason = " ".join(parts[2:]) if len(parts) > 2 else "unknown error"
+            print(f"[x] ADMIN RESETPASS failed: {reason}")
+        else:
+            print(f"[x] Unexpected ADMIN RESETPASS response: {resp}")
+
+    def admin_listusers(self):
+        """
+        Admin: list all users.
+
+        Protocol:
+            ADMIN LISTUSERS
+
+        Server format:
+            OK ADMIN LISTUSERS BEGIN
+            <username> <role> <user_id>
+            ...
+            OK ADMIN LISTUSERS END
+        """
+        if not self._check_admin("ADMIN LISTUSERS"):
+            return
+
+        timer = timed()
+        self._sendline("ADMIN LISTUSERS")
+        first_line = self._readline()
+        duration = timer()
+        self.perf.record_response(operation="admin_listusers", seconds=duration, source="client")
+
+        if first_line is None:
+            print("[x] No response for ADMIN LISTUSERS.")
+            return
+
+        if first_line.strip() != "OK ADMIN LISTUSERS BEGIN":
+            print(f"[x] Unexpected response: {first_line}")
+            return
+
+        print("[i] Users:")
+        while True:
+            line = self._readline()
+            if line is None:
+                print("[x] ADMIN LISTUSERS ended unexpectedly.")
+                return
+            if line.strip() == "OK ADMIN LISTUSERS END":
+                break
+            # Each line: "<username> <role> <user_id>"
+            print(f"  {line}")
+
+    #### File and directory commands (left for teammates) ####
+    def dir_list(self, path=None):
         """
         Request directory listing from the server.
 
-        Expected Behavior:
-            - Server returns a list of files and folders.
-            - Client displays and logs the directory contents.
+        Protocol:
+            DIR
+            DIR <subpath>
         """
-        print("[!] Directory listing not implemented yet.")
-        timer = timed()
-        self._sendline("DIR")
-        # Placeholder: receive and display directory contents from server.
-        duration = timer()
-        self.perf.record_response(operation="dir", seconds=duration)
-        # Placeholder: record list retrieval latency.
+        if not self.authenticated:
+            print("[!] Authenticate before using DIR.")
+            return
 
-    def delete(self, filename):
+        line = "DIR" if not path else f"DIR {path}"
+        timer = timed()
+        self._sendline(line)
+        resp = self._readline()
+        duration = timer()
+        self.perf.record_response(operation="dir", seconds=duration, source="client")
+
+        # Placeholder: handle listing output (single or multiple lines).
+        if resp is None:
+            print("[x] No response for DIR.")
+            return
+        print(f"[server] {resp}")
+
+    def delete(self, remote_path):
         """
         Delete a file on the server.
 
-        Parameters:
-            filename (str): Name of the file to delete.
-
-        Expected Behavior:
-            - Server confirms successful deletion.
-            - Client prints success and failure message.
+        Protocol:
+            DELETE <remote_path>
         """
-        print("[!] Delete command not implemented yet.")
+        if not self.authenticated:
+            print("[!] Authenticate before using DELETE.")
+            return
+
         timer = timed()
-        self._sendline(f"DELETE {filename}")
-        # Placeholder: handle server confirmation and error messages.
+        self._sendline(f"DELETE {remote_path}")
+        resp = self._readline()
         duration = timer()
-        self.perf.record_response(operation="delete", seconds=duration)
-        # Placeholder: record delete operation response time.
+        self.perf.record_response(operation="delete", seconds=duration, source="client")
+
+        # Placeholder: handle server confirmation or error.
+        if resp is None:
+            print("[x] No response for DELETE.")
+            return
+        print(f"[server] {resp}")
 
     def subfolder(self, action, path):
         """
         Manage subfolders on the server.
-        Supports creating or deleting directories.
 
-        Parameters:
-            action (str): 'create' or 'delete'
-            path (str): Target subfolder path
+        Protocol:
+            SUBFOLDER create <path>
+            SUBFOLDER delete <path>
         """
-        print("[!] Subfolder command not implemented yet.")
+        if not self.authenticated:
+            print("[!] Authenticate before using SUBFOLDER.")
+            return
+
+        action = action.lower()
+        if action not in ("create", "delete"):
+            print("[x] SUBFOLDER action must be 'create' or 'delete'.")
+            return
+
         timer = timed()
         self._sendline(f"SUBFOLDER {action} {path}")
-        # Placeholder: handle confirmation messages for subfolder creation/deletion.
+        resp = self._readline()
         duration = timer()
-        self.perf.record_response(operation="subfolder", seconds=duration)
-        # Placeholder: record subfolder operation latency metrics.
+        self.perf.record_response(operation="subfolder", seconds=duration, source="client")
 
-    def upload(self, local_path):
+        # Placeholder: handle server confirmation.
+        if resp is None:
+            print("[x] No response for SUBFOLDER.")
+            return
+        print(f"[server] {resp}")
+
+    def upload(self, local_path, remote_name=None):
         """
         Upload a file to the server.
 
-        Parameters:
-            local_path (str): Path to the local file to upload.
-
-        Expected Behavior:
-            - Client sends metadata (filename, size).
-            - Transfers file in chunks.
-            - Logs transfer time and throughput.
+        Protocol:
+            UPLOAD <remote_path> <size_bytes>
         """
-        print("[!] Upload not implemented yet.")
+        if not self.authenticated:
+            print("[!] Authenticate before using UPLOAD.")
+            return
+
         if not os.path.isfile(local_path):
             print("[x] Local file not found.")
             return
-        filename = os.path.basename(local_path)
+
+        filename = remote_name if remote_name else os.path.basename(local_path)
         size = os.path.getsize(local_path)
+        print(f"[!] Upload handler not implemented yet. Requested file: {filename} ({size} bytes).")
+
         timer = timed()
         self._sendline(f"UPLOAD {filename} {size}")
-        # Placeholder: send file data in chunks with progress reporting.
+        # Placeholder: send file data in chunks using BUFFER or similar.
+        resp = self._readline()
         duration = timer()
-        self.perf.record_transfer(operation="upload", bytes_count=size, seconds=duration)
-        # Placeholder: record upload throughput and total transfer duration.
+        self.perf.record_transfer(operation="upload", bytes_count=size, seconds=duration, source="client")
 
-    def download(self, filename):
+        # Placeholder: handle server upload status.
+        if resp is None:
+            print("[x] No response for UPLOAD.")
+            return
+        print(f"[server] {resp}")
+
+    def download(self, remote_name, local_path=None):
         """
         Download a file from the server.
 
-        Parameters:
-            filename (str): Name of the file to download.
-
-        Expected Behavior:
-            - Client requests file.
-            - Server sends file data.
-            - Client saves to local directory and verifies integrity.
+        Protocol:
+            DOWNLOAD <remote_path>
         """
-        print("[!] Download not implemented yet.")
+        if not self.authenticated:
+            print("[!] Authenticate before using DOWNLOAD.")
+            return
+
+        local_target = local_path if local_path else remote_name
+        print(f"[!] Download handler not implemented yet. Requested file: {remote_name}.")
+
         timer = timed()
-        self._sendline(f"DOWNLOAD {filename}")
-        # Placeholder: receive file data, write to disk, and verify checksum/integrity.
-        # Placeholder: track received byte count for throughput metrics.
+        self._sendline(f"DOWNLOAD {remote_name}")
+        # Placeholder: receive file size and file data, write to local_target.
+        resp = self._readline()
         duration = timer()
-        # Placeholder: replace bytes_count with actual file size when implemented.
-        self.perf.record_transfer(operation="download", bytes_count=0, seconds=duration)
-        # Placeholder: record download rate, duration, and response time.
+        # Placeholder: replace bytes_count=0 with actual file size once implemented.
+        self.perf.record_transfer(operation="download", bytes_count=0, seconds=duration, source="client")
+
+        # Placeholder: handle server download status.
+        if resp is None:
+            print("[x] No response for DOWNLOAD.")
+            return
+        print(f"[server] {resp}")

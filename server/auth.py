@@ -1,76 +1,546 @@
 # server/auth.py
 # Handles authentication for login, encryption, and verification of user credentials.
 
-import hashlib
-import json
-import os
+import hashlib      # password key derivation
+import json         # user database storage
+import os           # filesystem paths and files
+import threading    # user DB and key file locking
+from cryptography.fernet import Fernet, InvalidToken    # encrypted auth payloads
 
 #### Constants ####
-USER_DB = "server_users.json"  # Local JSON-based credential storage
+USER_DB = "server_users.json"          # Local JSON-based credential storage
+SECRET_KEY_FILE = "auth_secret.key"    # Symmetric key file for Fernet encryption
 ENCODING = "utf-8"
+
+# Password hashing parameters
+SALT_BYTES = 16
+PBKDF2_ITERATIONS = 150_000
+MIN_PASSWORD_LENGTH = 8
+
+# Known roles
+ROLE_USER = "user"
+ROLE_ADMIN = "admin"
+
+# Thread-level lock for user DB and key file access
+_USER_DB_LOCK = threading.Lock()
+_SECRET_KEY_LOCK = threading.Lock()
 
 #### Utility Setup ####
 def ensure_user_db():
     """
-    Ensure the user database file exists.
-    Creates an empty JSON file if none is present.
+    Create a user database file if it does not exist yet.
     """
-    if not os.path.exists(USER_DB):
-        with open(USER_DB, "w", encoding=ENCODING) as db:
-            json.dump({}, db)
+    with _USER_DB_LOCK:
+        if not os.path.exists(USER_DB):
+            print("[auth] Creating new user database:", USER_DB)
+            with open(USER_DB, "w", encoding=ENCODING) as db:
+                json.dump({}, db)
 
-#### Password Hashing ####
-def hash_password(password):
+def _load_user_db():
     """
-    Hash a password using SHA-256 for secure storage and comparison.
-
-    Parameters:
-        password (str): Plaintext password from user input
+    Load the user database JSON into memory.
 
     Returns:
-        str: Hexadecimal SHA-256 hash
+        dict: Mapping of username -> user record.
     """
-    print("[!] Password hashing placeholder called.")
-    return hashlib.sha256(password.encode(ENCODING)).hexdigest()
+    ensure_user_db()
+    with _USER_DB_LOCK:
+        with open(USER_DB, "r", encoding=ENCODING) as db:
+            try:
+                data = json.load(db)
+            except json.JSONDecodeError:
+                print("[auth] Corrupt user DB; using empty structure")
+                data = {}
+    if not isinstance(data, dict):
+        print("[auth] User DB is not a dict; resetting to empty")
+        data = {}
+    return data
+
+def _save_user_db(data):
+    """
+    Save the given user mapping back to the JSON file.
+
+    Parameters:
+        data (dict): Mapping of username -> user record.
+    """
+    with _USER_DB_LOCK:
+        tmp_path = USER_DB + ".tmp"
+        with open(tmp_path, "w", encoding=ENCODING) as db:
+            json.dump(data, db, indent=2)
+        os.replace(tmp_path, USER_DB)
+    print("[auth] User DB saved")
+
+def _generate_user_id(role):
+    """
+    Generate a simple user_id string based on role.
+
+    Parameters:
+        role (str): ROLE_USER or ROLE_ADMIN
+
+    Returns:
+        str: New user ID, e.g., 'U0001' or 'A0001'
+    """
+    prefix = "U" if role == ROLE_USER else "A"
+    data = _load_user_db()
+    existing = [
+        rec.get("user_id", "")
+        for rec in data.values()
+        if isinstance(rec, dict) and rec.get("role") == role
+    ]
+    max_num = 0
+    for uid in existing:
+        if uid.startswith(prefix):
+            try:
+                num = int(uid[1:])
+                if num > max_num:
+                    max_num = num
+            except ValueError:
+                continue
+    return f"{prefix}{max_num + 1:04d}"
+
+#### Secret Key Management (Fernet) ####
+def _load_or_create_secret_key():
+    """
+    Load the shared symmetric key from disk or create one if missing.
+
+    Returns:
+        bytes: Raw key bytes suitable for Fernet encryption.
+    """
+    with _SECRET_KEY_LOCK:
+        if os.path.exists(SECRET_KEY_FILE):
+            with open(SECRET_KEY_FILE, "rb") as f:
+                key = f.read().strip()
+                if key:
+                    return key
+                print("[auth] Secret key file empty; creating new key")
+
+        print("[auth] Creating new auth secret key:", SECRET_KEY_FILE)
+        key = Fernet.generate_key()
+        with open(SECRET_KEY_FILE, "wb") as f:
+            f.write(key)
+        return key
+
+def _get_cipher():
+    """
+    Create a Fernet cipher instance using the shared secret key.
+
+    Returns:
+        Fernet: Cipher object for encryption/decryption.
+    """
+    key = _load_or_create_secret_key()
+    return Fernet(key)
+
+def encrypt_payload(payload_dict):
+    """
+    Encrypt a small JSON payload for transit.
+
+    Parameters:
+        payload_dict (dict): Data to encode and encrypt.
+
+    Returns:
+        str: Base64 text token suitable for sending over the socket.
+    """
+    cipher = _get_cipher()
+    raw = json.dumps(payload_dict).encode(ENCODING)
+    token = cipher.encrypt(raw)
+    return token.decode(ENCODING)
+
+def decrypt_payload(token_str):
+    """
+    Decrypt a JSON payload received from a client.
+
+    Parameters:
+        token_str (str): Base64 text token from client.
+
+    Returns:
+        dict: Decoded JSON data.
+
+    Raises:
+        InvalidToken: If decryption or verification fails.
+        ValueError: If JSON decoding fails.
+    """
+    cipher = _get_cipher()
+    try:
+        token_bytes = token_str.encode(ENCODING)
+        raw = cipher.decrypt(token_bytes)
+        data = json.loads(raw.decode(ENCODING))
+        if not isinstance(data, dict):
+            raise ValueError("Decrypted payload is not a JSON object")
+        return data
+    except InvalidToken:
+        print("[auth] Invalid encrypted auth token")
+        raise
+    except json.JSONDecodeError as exc:
+        print("[auth] Decrypted payload is not valid JSON:", exc)
+        raise ValueError("Invalid JSON payload") from exc
+
+#### Password Hashing ####
+def _derive_password_hash(password, salt_bytes):
+    """
+    Derive a PBKDF2-HMAC hash for the given password and salt.
+
+    Parameters:
+        password (str): Plaintext password.
+        salt_bytes (bytes): Random salt bytes.
+
+    Returns:
+        str: Hex-encoded hash.
+    """
+    key = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode(ENCODING),
+        salt_bytes,
+        PBKDF2_ITERATIONS,
+    )
+    return key.hex()
+
+def _check_password_policy(password):
+    """
+    Apply a minimal password policy.
+
+    Parameters:
+        password (str): Candidate plaintext password.
+
+    Raises:
+        ValueError: If the password does not meet policy.
+    """
+    if not isinstance(password, str):
+        raise ValueError("Password must be a string")
+    if len(password) < MIN_PASSWORD_LENGTH:
+        raise ValueError(f"Password must be at least {MIN_PASSWORD_LENGTH} characters long")
+
+def hash_password(password):
+    """
+    Hash a password using PBKDF2-HMAC for storage and comparison.
+
+    Parameters:
+        password (str): Plaintext password from user input.
+
+    Returns:
+        tuple: (salt_hex, hash_hex)
+    """
+    _check_password_policy(password)
+    salt = os.urandom(SALT_BYTES)
+    pwd_hash = _derive_password_hash(password, salt)
+    salt_hex = salt.hex()
+    return salt_hex, pwd_hash
+
+def verify_password(password, salt_hex, stored_hash_hex):
+    """
+    Check a candidate password against stored salt and hash.
+
+    Parameters:
+        password (str): Candidate plaintext password.
+        salt_hex (str): Stored salt as hex string.
+        stored_hash_hex (str): Stored password hash as hex string.
+
+    Returns:
+        bool: True if the hash matches, False otherwise.
+    """
+    try:
+        salt = bytes.fromhex(salt_hex)
+    except ValueError:
+        print("[auth] Invalid salt in user DB")
+        return False
+    computed_hash = _derive_password_hash(password, salt)
+    return hashlib.compare_digest(computed_hash, stored_hash_hex)
 
 #### User Management ####
-def register_user(username, password):
+def register_user(username, password, role=ROLE_USER, overwrite=False):
     """
     Register a new user with hashed password.
 
     Parameters:
-        username (str): Username to register
-        password (str): Plaintext password
+        username (str): Username to register.
+        password (str): Plaintext password.
+        role     (str): ROLE_USER or ROLE_ADMIN.
+        overwrite (bool): If True, existing user entry will be replaced.
+
+    Returns:
+        dict: Newly created or updated user record.
+
+    Raises:
+        ValueError: If input is invalid or user exists and overwrite is False.
     """
-    print(f"[!] Register user not implemented yet. Attempted: {username}")
-    ensure_user_db()
-    # Placeholder: logic to check if user exists, then store hashed password.
+    if role not in (ROLE_USER, ROLE_ADMIN):
+        raise ValueError(f"Invalid role: {role}")
+    if not isinstance(username, str) or not username:
+        raise ValueError("Username must be a non-empty string")
+
+    data = _load_user_db()
+
+    if username in data and not overwrite:
+        raise ValueError(f"User '{username}' already exists")
+
+    salt_hex, pwd_hash = hash_password(password)
+    user_id = _generate_user_id(role) if username not in data else data[username].get("user_id")
+
+    user_record = {
+        "username": username,
+        "user_id": user_id,
+        "role": role,
+        "salt": salt_hex,
+        "password_hash": pwd_hash,
+    }
+    data[username] = user_record
+    _save_user_db(data)
+    print(f"[auth] Registered user '{username}' with role '{role}' and id '{user_id}'")
+    return user_record
+
+def delete_user(username):
+    """
+    Remove a user from the user database.
+
+    Parameters:
+        username (str): Username to delete.
+
+    Returns:
+        bool: True if user existed and was removed, False if user was missing.
+    """
+    data = _load_user_db()
+    if username not in data:
+        print(f"[auth] delete_user: '{username}' does not exist")
+        return False
+    del data[username]
+    _save_user_db(data)
+    print(f"[auth] Deleted user '{username}'")
+    return True
+
+def reset_password(username, new_password):
+    """
+    Reset a user's password to a new value.
+
+    Parameters:
+        username (str): Username whose password will change.
+        new_password (str): New plaintext password.
+
+    Returns:
+        bool: True if user exists and password changed, False otherwise.
+    """
+    data = _load_user_db()
+    record = data.get(username)
+    if not record:
+        print(f"[auth] reset_password: '{username}' does not exist")
+        return False
+
+    salt_hex, pwd_hash = hash_password(new_password)
+    record["salt"] = salt_hex
+    record["password_hash"] = pwd_hash
+    data[username] = record
+    _save_user_db(data)
+    print(f"[auth] Password reset for user '{username}'")
+    return True
+
+def set_role(username, new_role):
+    """
+    Change a user's role.
+
+    Parameters:
+        username (str): Username to change.
+        new_role (str): ROLE_USER or ROLE_ADMIN.
+
+    Returns:
+        bool: True if user exists and role changed, False otherwise.
+    """
+    if new_role not in (ROLE_USER, ROLE_ADMIN):
+        raise ValueError(f"Invalid role: {new_role}")
+
+    data = _load_user_db()
+    record = data.get(username)
+    if not record:
+        print(f"[auth] set_role: '{username}' does not exist")
+        return False
+
+    record["role"] = new_role
+    data[username] = record
+    _save_user_db(data)
+    print(f"[auth] Role for '{username}' changed to '{new_role}'")
+    return True
+
+def get_user(username):
+    """
+    Fetch a user record by username.
+
+    Parameters:
+        username (str): Username to look up.
+
+    Returns:
+        dict or None: User record or None if not found.
+    """
+    data = _load_user_db()
+    return data.get(username)
+
+def list_users():
+    """
+    Get a snapshot of current users.
+
+    Returns:
+        list: List of user records (dicts).
+    """
+    data = _load_user_db()
+    return list(data.values())
 
 def verify_credentials(username, password):
     """
     Verify login credentials for an incoming client connection.
 
     Parameters:
-        username (str): Username attempting to log in
-        password (str): Plaintext password provided by client
+        username (str): Username attempting to log in.
+        password (str): Plaintext password provided by client.
 
     Returns:
-        bool: True if credentials are valid, False otherwise
+        tuple:
+            bool: True if credentials are valid.
+            dict or None: User record on success, None on failure.
     """
-    print(f"[!] Verify credentials not implemented yet. User: {username}")
-    ensure_user_db()
-    # Placeholder: logic to check hashed password in user database.
-    return False
+    data = _load_user_db()
+    record = data.get(username)
+    if not record:
+        print(f"[auth] verify_credentials: user '{username}' not found")
+        return False, None
+
+    salt_hex = record.get("salt")
+    stored_hash = record.get("password_hash")
+    if not salt_hex or not stored_hash:
+        print(f"[auth] verify_credentials: user '{username}' missing salt/hash")
+        return False, None
+
+    if verify_password(password, salt_hex, stored_hash):
+        print(f"[auth] verify_credentials: user '{username}' authenticated")
+        return True, record
+
+    print(f"[auth] verify_credentials: invalid password for '{username}'")
+    return False, None
+
+#### Socket helpers ####
+def _recv_line(conn, max_bytes=4096):
+    """
+    Read a single line (terminated by '\\n') from a socket.
+
+    This protects against partial reads and overly long input.
+
+    Parameters:
+        conn (socket.socket): Connected socket.
+        max_bytes (int): Hard cap on bytes to read.
+
+    Returns:
+        str or None: Line without trailing newline, or None if connection closed.
+
+    Raises:
+        ValueError: If input exceeds max_bytes without newline.
+    """
+    buf = bytearray()
+    while len(buf) < max_bytes:
+        chunk = conn.recv(1024)
+        if not chunk:
+            if not buf:
+                return None
+            break
+        buf.extend(chunk)
+        if b"\n" in chunk:
+            break
+
+    if not buf:
+        return None
+    if len(buf) >= max_bytes and b"\n" not in buf:
+        raise ValueError("Line too long")
+
+    line, _, _ = buf.partition(b"\n")
+    return line.decode(ENCODING, errors="replace").strip()
 
 #### Connection-Level Handler ####
 def handle_auth(conn, addr):
     """
-    Handle authentication requests from connected clients.
-    Expected to receive credentials, validate them, and send response.
+    Handle a login authentication request from a connected client.
+
+    Protocol:
+        Client sends a single line:
+            AUTH <token>\\n
+
+        Where <token> is a Fernet-encrypted JSON payload:
+            {
+                "op": "login",
+                "username": "...",
+                "password": "..."
+            }
+
+        On success:
+            Server replies:
+                OK AUTH role=<role> user_id=<user_id>\\n
+
+        On failure:
+            Server replies:
+                ERR AUTH <reason>\\n
 
     Parameters:
-        conn (socket.socket): Active client connection
-        addr (tuple): Client address
+        conn (socket.socket): Active client connection.
+        addr (tuple): Client address.
+
+    Returns:
+        tuple:
+            bool: True if login succeeded, False otherwise.
+            dict or None: User record when login succeeds, None otherwise.
     """
-    print(f"[!] Authentication handler not implemented yet for {addr}.")
-    # Placeholder: receive credentials securely and verify.
+    try:
+        line = _recv_line(conn)
+        if line is None:
+            print(f"[auth] No data from {addr}; closing auth")
+            conn.sendall(b"ERR AUTH No data received\n")
+            return False, None
+
+        if not line.startswith("AUTH "):
+            print(f"[auth] Invalid auth command from {addr}")
+            conn.sendall(b"ERR AUTH Invalid auth command\n")
+            return False, None
+
+        _, token_str = line.split(" ", 1)
+
+        try:
+            payload = decrypt_payload(token_str)
+        except InvalidToken:
+            conn.sendall(b"ERR AUTH Invalid token\n")
+            return False, None
+        except ValueError:
+            conn.sendall(b"ERR AUTH Invalid payload\n")
+            return False, None
+
+        op = payload.get("op", "login")
+        if op != "login":
+            print(f"[auth] Unsupported auth op from {addr}")
+            conn.sendall(b"ERR AUTH Unsupported operation\n")
+            return False, None
+
+        username = payload.get("username")
+        password = payload.get("password")
+        if not username or not password:
+            conn.sendall(b"ERR AUTH Missing username or password\n")
+            return False, None
+
+        ok, record = verify_credentials(username, password)
+        if not ok or record is None:
+            conn.sendall(b"ERR AUTH Invalid credentials\n")
+            return False, None
+
+        role = record.get("role", ROLE_USER)
+        user_id = record.get("user_id", "")
+        response = f"OK AUTH role={role} user_id={user_id}\n"
+        conn.sendall(response.encode(ENCODING))
+        return True, record
+
+    except ValueError as exc:
+        print(f"[auth] Protocol error during auth for {addr}: {exc}")
+        try:
+            conn.sendall(b"ERR AUTH Protocol error\n")
+        except Exception:
+            pass
+        return False, None
+    except ConnectionError as exc:
+        print(f"[auth] Connection error during auth for {addr}: {exc}")
+        return False, None
+    except Exception as exc:
+        print(f"[auth] Unexpected error during auth for {addr}: {exc}")
+        try:
+            conn.sendall(b"ERR AUTH Server error\n")
+        except Exception:
+            pass
+        return False, None

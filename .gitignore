@@ -1,9 +1,14 @@
 # ========================================================
-# SocketFileShare's gitignore
+# SocketFileShare gitignore
 # ========================================================
 
-# Server storage directory (runtime data, uploaded files)
-server_storage/
+# Server storage and logs (runtime data, uploaded files, per-user logs)
+server/storage/
+server/logs/
+
+# Auth database and symmetric key (runtime and secrets)
+server_users.json
+auth_secret.key
 
 # Performance logs / Analysis outputs
 analysis/*.csv
@@ -11,16 +16,15 @@ analysis/*.json
 analysis/*.log
 analysis/*.txt
 
-# Temporary test files / Transferred sample data
+# Temporary test files / transferred sample data
 uploads/
 downloads/
 temp/
 *.tmp
 *.bak
 
-# Socket debug / Error logs
+# Socket debug / error logs
 *.log
-logs/
 
 # Local configuration / credentials
 config.json
@@ -36,7 +40,7 @@ secrets.json
 Thumbs.db
 
 # ========================================================
-# GitHub's Standard Python gitignore
+# GitHub Standard Python gitignore
 # ========================================================
 
 # Byte-compiled / optimized / DLL files
@@ -181,7 +185,9 @@ celerybeat.pid
 .envrc
 .venv
 env/
+.env/
 venv/
+.venv/
 ENV/
 env.bak/
 venv.bak/
