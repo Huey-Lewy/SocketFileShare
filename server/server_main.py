@@ -23,7 +23,6 @@ class ClientSession:
     """
     Holds per-connection state for an authenticated client.
     """
-
     def __init__(self, conn, addr, user_record, storage_root, log_path):
         self.conn = conn
         self.addr = addr
@@ -66,7 +65,7 @@ def _prompt_server_config():
         return None
 
     if not (0 <= port <= 65535):
-        print("Port must be between 0–65535.")
+        print("Port must be between 0-65535.")
         return None
 
     return host, port
@@ -166,9 +165,17 @@ def _handle_self_passwd(session, line):
         session.log("PASSWD failed: invalid old password")
         return
 
-    if not auth.reset_password(session.username, new_pwd):
-        _send_line(session.conn, "ERR PASSWD Could not reset password")
-        session.log("PASSWD failed: reset error")
+    try:
+        # This can raise ValueError if password policy fails
+        if not auth.reset_password(session.username, new_pwd):
+            _send_line(session.conn, "ERR PASSWD Could not reset password")
+            session.log("PASSWD failed: reset error")
+            return
+    except ValueError as exc:
+        # Send policy error back to client instead of dropping connection
+        msg = str(exc) or "Password policy error"
+        _send_line(session.conn, f"ERR PASSWD {msg}")
+        session.log(f"PASSWD failed: {msg}")
         return
 
     _send_line(session.conn, "OK PASSWD Password changed")
@@ -304,7 +311,15 @@ def _handle_admin_command(session, line):
             session.log("ADMIN RESETPASS failed: missing new password")
             return
 
-        if not auth.reset_password(username, new_pwd):
+        try:
+            ok = auth.reset_password(username, new_pwd)
+        except ValueError as exc:
+            msg = str(exc) or "Password policy error"
+            _send_line(session.conn, f"ERR ADMIN {msg}")
+            session.log(f"ADMIN RESETPASS failed: {msg}")
+            return
+
+        if not ok:
             _send_line(session.conn, "ERR ADMIN User not found")
             session.log(f"ADMIN RESETPASS failed: user '{username}' not found")
             return
