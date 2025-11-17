@@ -1,11 +1,11 @@
 # client/client_main.py
-# Runs the client connection and command session.
+# Runs the client connection and interactive command session.
 
-import socket       # client TCP connect
+import socket       # client TCP connect / error types
 import sys          # launcher exit codes
 import getpass      # hidden password prompts
-from client.commands import ClientSession                       # high-level client session API
-from analysis.performance_eval import PerfRecorder, timed       # session metrics
+from client.commands import ClientSession             # high-level client session API
+from analysis.performance_eval import PerfRecorder, timed   # client-side session metrics
 
 #### Constants ####
 USAGE = (
@@ -29,15 +29,19 @@ USAGE = (
 #### Interactive Setup ####
 def _prompt_server_target():
     """
-    Prompt you for server IP and port.
-    Exit if input is invalid.
+    Prompt for server IP and port and return them as (ip, port).
+
+    Exits the program if the input is invalid or out of range.
     """
     print("====== CNT3004 Socket File Sharing Client ======")
+
+    # Ask for server IP / hostname.
     server_ip = input("Enter server IP address: ").strip()
     if not server_ip:
         print("Server IP cannot be empty.")
         sys.exit(1)
 
+    # Ask for TCP port and validate it is an integer in 0-65535.
     port_str = input("Enter server port: ").strip()
     try:
         server_port = int(port_str)
@@ -51,33 +55,46 @@ def _prompt_server_target():
 
     return server_ip, server_port
 
+
 def _initial_auth(session):
     """
-    Run initial login after TCP connection.
+    Run the initial login sequence after the TCP connection is established.
 
-    Prompts:
-        user: <username>
-        pass: <password hidden>
+    Prompts for username and password, calls session.auth(), and repeats
+    until authentication succeeds or the user cancels.
+
+    Returns:
+        bool: True if authentication succeeded, False otherwise.
     """
     while True:
+        # If TCP is not connected, try to connect first.
         if not session.connected:
             print("[i] Connecting to server...")
             session.connect()
             if not session.connected:
+                # Connection failed; let caller decide what to do.
                 print("[x] Could not connect to server.")
                 return False
 
-        print("--- Login ---")
+        print("---- Login ----")
+
+        # Ask for username and ensure it is not empty.
         username = input("user: ").strip()
         if not username:
             print("[x] Username cannot be empty.")
             continue
 
+        # Password is taken via `getpass` so it is not echoed.
         password = getpass.getpass("pass: ")
+
+        # Delegate the actual authentication protocol to ClientSession.auth().
         ok = session.auth(username, password)
         if ok:
+            # The server has verified the credentials and
+            # the session has username / user_id / role filled in.
             return True
 
+        # If not ok, ask if user wants to try again.
         choice = input("Authentication failed. Try again? [y/N]: ").strip().lower()
         if choice not in ("y", "yes"):
             return False
@@ -85,7 +102,7 @@ def _initial_auth(session):
 #### Command handlers ####
 def _handle_passwd(session):
     """
-    Handle 'passwd' command for changing your password.
+    Process the 'passwd' command to change the current user's password.
     """
     if not session.authenticated:
         print("[!] You must authenticate first.")
@@ -103,7 +120,7 @@ def _handle_passwd(session):
 
 def _handle_admin_adduser(session, parts):
     """
-    Handle admin-adduser command.
+    Process the 'admin-adduser' command to create a new user account.
     """
     if len(parts) != 3:
         print("Use: admin-adduser <username> <role>")
@@ -111,6 +128,7 @@ def _handle_admin_adduser(session, parts):
 
     username = parts[1]
     role = parts[2]
+
     pwd = getpass.getpass(f"New password for '{username}': ")
     confirm = getpass.getpass("Confirm password: ")
     if pwd != confirm:
@@ -121,48 +139,51 @@ def _handle_admin_adduser(session, parts):
 
 def _handle_admin_deluser(session, parts):
     """
-    Handle admin-deluser command.
+    Process the 'admin-deluser' command to remove an existing user.
     """
     if len(parts) != 2:
         print("Use: admin-deluser <username>")
         return
+
     session.admin_deluser(parts[1])
 
 def _handle_admin_setrole(session, parts):
     """
-    Handle admin-setrole command.
+    Process the 'admin-setrole' command to change a user's role.
     """
     if len(parts) != 3:
         print("Use: admin-setrole <username> <role>")
         return
+
     session.admin_setrole(parts[1], parts[2])
 
 def _handle_admin_resetpass(session, parts):
     """
-    Handle admin-resetpass command.
+    Process the 'admin-resetpass' command to reset another user's password.
     """
     if len(parts) != 2:
         print("Use: admin-resetpass <username>")
         return
+
     username = parts[1]
     new_pwd = getpass.getpass(f"New password for '{username}': ")
     confirm = getpass.getpass("Confirm password: ")
     if new_pwd != confirm:
         print("[x] Passwords do not match.")
         return
+
     session.admin_resetpass(username, new_pwd)
 
 def _handle_logout(session):
     """
-    Handle 'logout' command.
+    Process the 'logout' command and optionally start a new login session.
 
-    Steps:
-      - Send LOGOUT and close current connection.
-      - Prompt for a new username/password and attempt re-auth.
-      - Return True to keep the client running, False to exit.
+    Returns:
+        bool: True to keep the client running, False to exit.
     """
     session.logout()
     print("")
+
     if _initial_auth(session):
         print("Re-authenticated. Type 'help' for commands. Type 'quit' to exit.\n")
         return True
@@ -172,35 +193,38 @@ def _handle_logout(session):
 
 def _dispatch(session, line):
     """
-    Parse user input and execute the corresponding ClientSession method.
-    Returns False to terminate the loop; True to continue.
+    Parse a user input line and dispatch it to the appropriate handler.
+
+    Returns:
+        bool: False to terminate the main loop; True to continue.
     """
     if not line:
+        # Empty input line; keep loop going.
         return True
 
     parts = line.split()
     cmd = parts[0].lower()
 
-    # Quit / exit: logout and exit client
+    # Quit / exit: logout and exit client entirely.
     if cmd in ("quit", "exit"):
         session.logout()
         return False
 
-    # Logout: close current session, then re-login
+    # Logout: close current session, then run a new login sequence.
     if cmd == "logout":
         return _handle_logout(session)
 
-    # Help
+    # Help text request.
     if cmd == "help":
         print(USAGE)
         return True
 
-    # Change password
+    # Change password.
     if cmd == "passwd":
         _handle_passwd(session)
         return True
 
-    # Upload file (stub)
+    # Upload file (stub; real transfer logic in ClientSession.upload).
     if cmd == "upload":
         if len(parts) >= 2:
             local_path = parts[1]
@@ -210,7 +234,7 @@ def _dispatch(session, line):
             print("Use: upload <local_path> [remote]")
         return True
 
-    # Download file (stub)
+    # Download file (stub; real transfer logic in ClientSession.download).
     if cmd == "download":
         if len(parts) >= 2:
             remote_name = parts[1]
@@ -220,7 +244,7 @@ def _dispatch(session, line):
             print("Use: download <remote> [local]")
         return True
 
-    # Delete file (stub)
+    # Delete file (stub; real logic in ClientSession.delete).
     if cmd == "delete":
         if len(parts) == 2:
             session.delete(parts[1])
@@ -228,13 +252,13 @@ def _dispatch(session, line):
             print("Use: delete <remote_path>")
         return True
 
-    # Directory listing (stub)
+    # Directory listing (stub; real logic in ClientSession.dir_list).
     if cmd == "dir":
         subpath = parts[1] if len(parts) >= 2 else None
         session.dir_list(subpath)
         return True
 
-    # Subfolder create/delete (stub)
+    # Subfolder create/delete (stub; real logic in ClientSession.subfolder).
     if cmd == "subfolder":
         if len(parts) >= 3:
             action = parts[1].lower()
@@ -244,7 +268,7 @@ def _dispatch(session, line):
             print("Use: subfolder <create|delete> <path>")
         return True
 
-    # Admin commands
+    # Admin commands: forwarded to corresponding ClientSession admin helpers.
     if cmd == "admin-adduser":
         _handle_admin_adduser(session, parts)
         return True
@@ -265,28 +289,37 @@ def _dispatch(session, line):
         session.admin_listusers()
         return True
 
+    # Fallback for unknown commands.
     print("Unknown or malformed command. Type 'help'.")
     return True
 
+
 #### Main Entry Point ####
 def main():
-    """Main entry point for the client program."""
+    """
+    Launch the client program and drive the interactive command session.
+
+    Returns:
+        bool: True on normal exit, False when setup or auth fails.
+    """
     server_ip, server_port = _prompt_server_target()
 
-    # Local performance recorder for the client session lifetime
+    # Local performance recorder for the *client-side* session lifetime.
+    # Per-command metrics (auth, upload, download, etc.) are recorded inside the ClientSession instance (client.commands).
+    # This recorder focuses on the overall interactive session length from the user's perspective.
     perf = PerfRecorder()
 
-    # Initialize client session
+    # Initialize client session and timer for high-level session duration.
     session = ClientSession(server_ip, server_port)
-    timer = timed()  # Track session duration
+    timer = timed()  # Tracks entire time spent in this client run.
 
-    # Connect once; _initial_auth will reconnect if connection drops later
+    # Open TCP connection once; _initial_auth may reconnect if needed.
     session.connect()
     if not session.connected:
         print("[x] Could not establish connection. Returning to main menu.\n")
         return False
 
-    # Initial login
+    # Perform initial authentication (server-side auth is authoritative).
     if not _initial_auth(session):
         session.close()
         print("[x] Authentication failed. Returning to main menu.\n")
@@ -296,22 +329,26 @@ def main():
 
     print("Connected and authenticated. Type 'help' for commands.\n")
 
-    # Interactive loop
+    # Interactive command loop.
     try:
         while True:
             try:
+                # Prompt shows current username and role returned by the server.
                 prompt_user = session.username or "guest"
                 prompt_role = session.role or "none"
                 line = input(f"[{prompt_user}@{prompt_role}]> ").strip()
             except EOFError:
+                # Ctrl+D / end-of-file: treat as quit.
                 line = "quit"
             except KeyboardInterrupt:
+                # Ctrl+C from the user: also treat as quit.
                 print("\n[i] Interrupted.")
                 line = "quit"
 
             try:
                 keep_running = _dispatch(session, line)
             except (socket.error, OSError) as e:
+                # Network failure ends the loop; higher-level retry could be added.
                 print(f"Network error: {e}")
                 keep_running = False
 
@@ -319,12 +356,14 @@ def main():
                 break
 
     finally:
+        # Record total client session duration for performance evaluation.
         elapsed = timer()
         perf.record_response(operation="client_session", seconds=elapsed, source="client")
         session.close()
         print(f"Disconnected from server. Session duration: {elapsed:.2f}s\n")
 
-    return True  # Indicate normal exit for main.py
+    # Indicate normal exit to main.py launcher.
+    return True
 
 #### Run as Script ####
 if __name__ == "__main__":

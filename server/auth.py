@@ -1,48 +1,73 @@
 # server/auth.py
 # Handles authentication for login, encryption, and verification of user credentials.
 
-import hashlib      # password key derivation
-import json         # user database storage
+import hashlib      # password key derivation (PBKDF2)
+import json         # user database storage (small JSON file)
 import os           # filesystem paths and files
 import threading    # user DB and key file locking
-import hmac         # constant-time compare
+import hmac         # constant-time compare for password hashes
 from cryptography.fernet import Fernet, InvalidToken    # encrypted auth payloads
 
-#### Constants ####
-USER_DB = "server_users.json"          # Local JSON-based credential storage
-SECRET_KEY_FILE = "auth_secret.key"    # Symmetric key file for Fernet encryption
+#### Paths and constants ####
+# Base directory of the server package
+BASE_DIR = os.path.dirname(__file__)
+
+# All auth-related files live under server/storage/database/
+STORAGE_ROOT = os.path.join(BASE_DIR, "storage")
+DATABASE_ROOT = os.path.join(STORAGE_ROOT, "database")
+
+# Local JSON-based credential storage and symmetric key file
+USER_DB = os.path.join(DATABASE_ROOT, "server_users.json")
+SECRET_KEY_FILE = os.path.join(DATABASE_ROOT, "auth_secret.key")
+
 ENCODING = "utf-8"
 
-# Password hashing parameters
+# Password hashing parameters (PBKDF2-HMAC with SHA-256)
 SALT_BYTES = 16
 PBKDF2_ITERATIONS = 150_000
 MIN_PASSWORD_LENGTH = 8
 
-# Known roles
+# Known roles (project only needs basic access control)
 ROLE_USER = "user"
 ROLE_ADMIN = "admin"
 
-# Thread-level lock for user DB and key file access
+# Thread-level locks for user DB and key file access
 _USER_DB_LOCK = threading.Lock()
 _SECRET_KEY_LOCK = threading.Lock()
 
-#### Utility Setup ####
-def ensure_user_db():
+#### Utility helpers for paths ####
+def _make_dirs(path):
+    """
+    Create a directory tree if it does not exist.
+
+    This keeps auth data (JSON DB and key) under server/storage/database/.
+    """
+    if not os.path.exists(path):
+        os.makedirs(path, exist_ok=True)
+
+#### Utility setup ####
+def init_user_db():
     """
     Create a user database file if it does not exist yet.
+
+    This is a small JSON file that maps username -> user record.
     """
+    _make_dirs(DATABASE_ROOT)
     with _USER_DB_LOCK:
         if not os.path.exists(USER_DB):
-            print("[auth] Creating new user database:", USER_DB)
+            print(f"[auth] Creating new user database: {USER_DB}")
             with open(USER_DB, "w", encoding=ENCODING) as db:
+                # Start with an empty mapping
                 json.dump({}, db)
 
 def init_auth_store():
     """
     Initialize authentication-related storage so that
     the user DB and secret key files exist.
+
+    main.py calls this before the server starts.
     """
-    ensure_user_db()
+    init_user_db()
     _load_or_create_secret_key()
 
 def _load_user_db():
@@ -52,12 +77,13 @@ def _load_user_db():
     Returns:
         dict: Mapping of username -> user record.
     """
-    ensure_user_db()
+    init_user_db()
     with _USER_DB_LOCK:
         with open(USER_DB, "r", encoding=ENCODING) as db:
             try:
                 data = json.load(db)
             except json.JSONDecodeError:
+                # If the file is corrupt, start from an empty mapping
                 print("[auth] Corrupt user DB; using empty structure")
                 data = {}
     if not isinstance(data, dict):
@@ -72,49 +98,56 @@ def _save_user_db(data):
     Parameters:
         data (dict): Mapping of username -> user record.
     """
+    _make_dirs(DATABASE_ROOT)
     with _USER_DB_LOCK:
         tmp_path = USER_DB + ".tmp"
+        # Write to a temp file first, then atomically replace
         with open(tmp_path, "w", encoding=ENCODING) as db:
             json.dump(data, db, indent=2)
         os.replace(tmp_path, USER_DB)
     print("[auth] User DB saved")
 
-def _generate_user_id(role):
+def _generate_user_id():
     """
-    Generate a simple user_id string based on role.
+    Generate a simple numeric user_id string.
 
-    Parameters:
-        role (str): ROLE_USER or ROLE_ADMIN
+    IDs:
+      - are numeric strings like "0001", "0002"
+      - do not depend on role
+      - stay stable for a username
 
-    Returns:
-        str: New user ID, e.g., 'U0001' or 'A0001'
+    This scans the existing DB and picks the next free number.
     """
-    prefix = "U" if role == ROLE_USER else "A"
     data = _load_user_db()
-    existing = [
-        rec.get("user_id", "")
-        for rec in data.values()
-        if isinstance(rec, dict) and rec.get("role") == role
-    ]
-    max_num = 0
-    for uid in existing:
-        if uid.startswith(prefix):
-            try:
-                num = int(uid[1:])
-                if num > max_num:
-                    max_num = num
-            except ValueError:
-                continue
-    return f"{prefix}{max_num + 1:04d}"
 
-#### Secret Key Management (Fernet) ####
+    max_num = 0
+    # Walk all records and track the highest numeric id
+    for rec in data.values():
+        if not isinstance(rec, dict):
+            continue
+        uid = rec.get("user_id")
+        if not uid:
+            continue
+        try:
+            num = int(uid)
+            if num > max_num:
+                max_num = num
+        except ValueError:
+            # Ignore non-numeric ids
+            continue
+
+    # Pad with zeros, 4 digits (e.g., "0001")
+    return f"{max_num + 1:04d}"
+
+#### Secret key management (Fernet) ####
 def _load_or_create_secret_key():
     """
     Load the shared symmetric key from disk or create one if missing.
 
-    Returns:
-        bytes: Raw key bytes suitable for Fernet encryption.
+    This key is used with Fernet to encrypt small auth payloads,
+    so the client never sends passwords in clear text.
     """
+    _make_dirs(DATABASE_ROOT)
     with _SECRET_KEY_LOCK:
         if os.path.exists(SECRET_KEY_FILE):
             with open(SECRET_KEY_FILE, "rb") as f:
@@ -123,7 +156,7 @@ def _load_or_create_secret_key():
                     return key
                 print("[auth] Secret key file empty; creating new key")
 
-        print("[auth] Creating new auth secret key:", SECRET_KEY_FILE)
+        print(f"[auth] Creating new auth secret key: {SECRET_KEY_FILE}")
         key = Fernet.generate_key()
         with open(SECRET_KEY_FILE, "wb") as f:
             f.write(key)
@@ -174,6 +207,7 @@ def decrypt_payload(token_str):
         raw = cipher.decrypt(token_bytes)
         data = json.loads(raw.decode(ENCODING))
         if not isinstance(data, dict):
+            # We expect a JSON object, not a list or primitive
             raise ValueError("Decrypted payload is not a JSON object")
         return data
     except InvalidToken:
@@ -183,7 +217,7 @@ def decrypt_payload(token_str):
         print("[auth] Decrypted payload is not valid JSON:", exc)
         raise ValueError("Invalid JSON payload") from exc
 
-#### Password Hashing ####
+#### Password hashing ####
 def _derive_password_hash(password, salt_bytes):
     """
     Derive a PBKDF2-HMAC hash for the given password and salt.
@@ -195,6 +229,7 @@ def _derive_password_hash(password, salt_bytes):
     Returns:
         str: Hex-encoded hash.
     """
+    # PBKDF2 slows down brute-force attacks
     key = hashlib.pbkdf2_hmac(
         "sha256",
         password.encode(ENCODING),
@@ -229,6 +264,7 @@ def hash_password(password):
         tuple: (salt_hex, hash_hex)
     """
     _check_password_policy(password)
+    # Generate a random salt for this password
     salt = os.urandom(SALT_BYTES)
     pwd_hash = _derive_password_hash(password, salt)
     salt_hex = salt.hex()
@@ -251,11 +287,12 @@ def verify_password(password, salt_hex, stored_hash_hex):
     except ValueError:
         print("[auth] Invalid salt in user DB")
         return False
+
     computed_hash = _derive_password_hash(password, salt)
-    # Use constant-time comparison to reduce timing side channels.
+    # Use constant-time comparison to reduce timing side channels
     return hmac.compare_digest(computed_hash, stored_hash_hex)
 
-#### User Management ####
+#### User management ####
 def register_user(username, password, role=ROLE_USER, overwrite=False):
     """
     Register a new user with hashed password.
@@ -264,7 +301,7 @@ def register_user(username, password, role=ROLE_USER, overwrite=False):
         username (str): Username to register.
         password (str): Plaintext password.
         role     (str): ROLE_USER or ROLE_ADMIN.
-        overwrite (bool): If True, existing user entry will be replaced.
+        overwrite (bool): If True, replace an existing user entry.
 
     Returns:
         dict: Newly created or updated user record.
@@ -283,7 +320,12 @@ def register_user(username, password, role=ROLE_USER, overwrite=False):
         raise ValueError(f"User '{username}' already exists")
 
     salt_hex, pwd_hash = hash_password(password)
-    user_id = _generate_user_id(role) if username not in data else data[username].get("user_id")
+
+    # If the user already exists and we are overwriting, keep the same id.
+    if username in data and overwrite:
+        user_id = data[username].get("user_id")
+    else:
+        user_id = _generate_user_id()
 
     user_record = {
         "username": username,
@@ -311,6 +353,8 @@ def delete_user(username):
     if username not in data:
         print(f"[auth] delete_user: '{username}' does not exist")
         return False
+
+    # At this layer we only remove auth info; storage cleanup can live in server-side code.
     del data[username]
     _save_user_db(data)
     print(f"[auth] Deleted user '{username}'")
@@ -361,6 +405,7 @@ def set_role(username, new_role):
         print(f"[auth] set_role: '{username}' does not exist")
         return False
 
+    # Only the role field changes; user_id stays stable.
     record["role"] = new_role
     data[username] = record
     _save_user_db(data)
@@ -443,6 +488,7 @@ def _recv_line(conn, max_bytes=4096):
     while len(buf) < max_bytes:
         chunk = conn.recv(1024)
         if not chunk:
+            # Remote side closed connection
             if not buf:
                 return None
             break
@@ -458,7 +504,7 @@ def _recv_line(conn, max_bytes=4096):
     line, _, _ = buf.partition(b"\n")
     return line.decode(ENCODING, errors="replace").strip()
 
-#### Connection-Level Handler ####
+#### Connection-level handler ####
 def handle_auth(conn, addr):
     """
     Handle a login authentication request from a connected client.
@@ -508,9 +554,11 @@ def handle_auth(conn, addr):
         try:
             payload = decrypt_payload(token_str)
         except InvalidToken:
+            # Ciphertext could not be verified; drop login
             conn.sendall(b"ERR AUTH Invalid token\n")
             return False, None
         except ValueError:
+            # JSON payload was malformed
             conn.sendall(b"ERR AUTH Invalid payload\n")
             return False, None
 
@@ -533,6 +581,7 @@ def handle_auth(conn, addr):
 
         role = record.get("role", ROLE_USER)
         user_id = record.get("user_id", "")
+        # Only send role and id, not any secret data
         response = f"OK AUTH role={role} user_id={user_id}\n"
         conn.sendall(response.encode(ENCODING))
         return True, record

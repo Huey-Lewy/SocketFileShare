@@ -17,9 +17,10 @@ CLIENT_SECRET_KEY_FILE = "auth_secret.key"  # Must match server's key file
 #### Encryption helpers ####
 def _load_shared_key():
     """
-    Load the shared encryption key used for auth-related payloads.
+    Load the shared Fernet key used for auth and admin payloads.
 
-    The same key file must be present on server and client hosts.
+    Returns:
+        bytes | None: Key bytes if available, otherwise None.
     """
     if not os.path.exists(CLIENT_SECRET_KEY_FILE):
         print(f"[auth] Shared key file '{CLIENT_SECRET_KEY_FILE}' not found.")
@@ -40,7 +41,7 @@ def _get_cipher():
     Create a Fernet cipher instance using the shared key.
 
     Returns:
-        Fernet or None: Cipher object or None if key is unavailable.
+        Fernet | None: Cipher object, or None if the key cannot be loaded.
     """
     key = _load_shared_key()
     if key is None:
@@ -57,10 +58,10 @@ def encrypt_payload(payload_dict):
     Encrypt a small JSON payload for transit.
 
     Parameters:
-        payload_dict (dict): Data to encode and encrypt.
+        payload_dict (dict): Data to JSON-encode and encrypt.
 
     Returns:
-        str or None: Base64 text token, or None on error.
+        str | None: Base64 token string on success, or None on error.
     """
     cipher = _get_cipher()
     if cipher is None:
@@ -76,6 +77,16 @@ def encrypt_payload(payload_dict):
 
 #### Client session ####
 class ClientSession:
+    """
+    High-level client session wrapper for one TCP connection.
+
+    Tracks:
+      - Server address (ip, port)
+      - Socket object and connection state
+      - Authenticated username, user_id, and role
+      - Client-side performance metrics
+    """
+
     def __init__(self, ip, port):
         self.addr = (ip, port)              # Server (ip, port)
         self.sock = None                    # Active socket
@@ -91,7 +102,7 @@ class ClientSession:
     #### Basic Helpers ####
     def _sendline(self, line):
         """
-        Encode and send a single line terminated with newline.
+        Send a single line to the server, appending a newline.
         """
         if not self.sock:
             print("[!] No active connection.")
@@ -103,10 +114,10 @@ class ClientSession:
 
     def _readline(self):
         """
-        Read a single newline-terminated line; return decoded str without newline.
+        Read a single newline-terminated line from the server.
 
         Returns:
-            str or None: Line text or None on EOF.
+            str | None: Line text without the newline, or None on EOF.
         """
         if not self.sock:
             return None
@@ -130,7 +141,7 @@ class ClientSession:
     #### Connection Lifecycle ####
     def connect(self):
         """
-        Open a TCP connection to the server address.
+        Open a TCP connection to the configured server address.
 
         Returns:
             bool: True on success, False on failure.
@@ -155,7 +166,7 @@ class ClientSession:
 
     def logout(self):
         """
-        Send logout command and close the connection.
+        Send a LOGOUT command and close the connection.
         """
         if not self.connected or not self.sock:
             print("[!] Not connected to a server.")
@@ -174,7 +185,7 @@ class ClientSession:
 
     def close(self):
         """
-        Safely close the socket connection.
+        Safely close the socket and reset session state.
         """
         if self.sock:
             try:
@@ -193,17 +204,10 @@ class ClientSession:
     #### Authentication and account commands ####
     def auth(self, username, password):
         """
-        Authenticate user with the server.
+        Authenticate with the server using an encrypted AUTH payload.
 
-        Protocol:
-            AUTH <token>
-
-        Where <token> is an encrypted JSON payload:
-            {
-                "op": "login",
-                "username": "...",
-                "password": "..."
-            }
+        Returns:
+            bool: True if authentication succeeds, False otherwise.
         """
         if not self.connected or not self.sock:
             print("[!] Not connected; cannot authenticate.")
@@ -260,17 +264,7 @@ class ClientSession:
 
     def change_password(self, old_password, new_password):
         """
-        Change password for the current user.
-
-        Protocol:
-            PASSWD <token>
-
-        Where <token> is an encrypted JSON payload:
-            {
-                "op": "passwd",
-                "old_password": "...",
-                "new_password": "..."
-            }
+        Change the current user's password via the PASSWD command.
         """
         if not self.authenticated:
             print("[!] You must authenticate before changing password.")
@@ -308,6 +302,12 @@ class ClientSession:
 
     #### Admin commands ####
     def _check_admin(self, cmd_name):
+        """
+        Verify that the current session is authenticated as an admin.
+
+        Returns:
+            bool: True if the admin command is allowed, False otherwise.
+        """
         if self.role != "admin":
             print(f"[!] {cmd_name} denied: not logged in as admin.")
             return False
@@ -318,10 +318,7 @@ class ClientSession:
 
     def admin_adduser(self, username, role, password):
         """
-        Admin: add a new user.
-
-        Protocol:
-            ADMIN ADDUSER <username> <role> <token>
+        Send an ADMIN ADDUSER command to create a new user.
         """
         if not self._check_admin("ADMIN ADDUSER"):
             return
@@ -357,10 +354,7 @@ class ClientSession:
 
     def admin_deluser(self, username):
         """
-        Admin: delete an existing user.
-
-        Protocol:
-            ADMIN DELUSER <username>
+        Send an ADMIN DELUSER command to remove a user.
         """
         if not self._check_admin("ADMIN DELUSER"):
             return
@@ -387,10 +381,7 @@ class ClientSession:
 
     def admin_setrole(self, username, role):
         """
-        Admin: change a user's role.
-
-        Protocol:
-            ADMIN SETROLE <username> <role>
+        Send an ADMIN SETROLE command to change a user's role.
         """
         if not self._check_admin("ADMIN SETROLE"):
             return
@@ -417,10 +408,7 @@ class ClientSession:
 
     def admin_resetpass(self, username, new_password):
         """
-        Admin: reset a user's password.
-
-        Protocol:
-            ADMIN RESETPASS <username> <token>
+        Send an ADMIN RESETPASS command to set a new password for a user.
         """
         if not self._check_admin("ADMIN RESETPASS"):
             return
@@ -456,16 +444,7 @@ class ClientSession:
 
     def admin_listusers(self):
         """
-        Admin: list all users.
-
-        Protocol:
-            ADMIN LISTUSERS
-
-        Server format:
-            OK ADMIN LISTUSERS BEGIN
-            <username> <role> <user_id>
-            ...
-            OK ADMIN LISTUSERS END
+        Send an ADMIN LISTUSERS command and print the returned user list.
         """
         if not self._check_admin("ADMIN LISTUSERS"):
             return
@@ -498,11 +477,7 @@ class ClientSession:
     #### File and directory commands (left for teammates) ####
     def dir_list(self, path=None):
         """
-        Request directory listing from the server.
-
-        Protocol:
-            DIR
-            DIR <subpath>
+        Request a directory listing from the server via the DIR command.
         """
         if not self.authenticated:
             print("[!] Authenticate before using DIR.")
@@ -523,10 +498,7 @@ class ClientSession:
 
     def delete(self, remote_path):
         """
-        Delete a file on the server.
-
-        Protocol:
-            DELETE <remote_path>
+        Request deletion of a remote file via the DELETE command.
         """
         if not self.authenticated:
             print("[!] Authenticate before using DELETE.")
@@ -546,11 +518,7 @@ class ClientSession:
 
     def subfolder(self, action, path):
         """
-        Manage subfolders on the server.
-
-        Protocol:
-            SUBFOLDER create <path>
-            SUBFOLDER delete <path>
+        Manage remote subfolders using the SUBFOLDER command.
         """
         if not self.authenticated:
             print("[!] Authenticate before using SUBFOLDER.")
@@ -575,10 +543,7 @@ class ClientSession:
 
     def upload(self, local_path, remote_name=None):
         """
-        Upload a file to the server.
-
-        Protocol:
-            UPLOAD <remote_path> <size_bytes>
+        Request an upload of a local file to the server via the UPLOAD command.
         """
         if not self.authenticated:
             print("[!] Authenticate before using UPLOAD.")
@@ -607,10 +572,7 @@ class ClientSession:
 
     def download(self, remote_name, local_path=None):
         """
-        Download a file from the server.
-
-        Protocol:
-            DOWNLOAD <remote_path>
+        Request a download of a remote file from the server via the DOWNLOAD command.
         """
         if not self.authenticated:
             print("[!] Authenticate before using DOWNLOAD.")

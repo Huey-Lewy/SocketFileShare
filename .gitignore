@@ -2,15 +2,10 @@
 # SocketFileShare gitignore
 # ========================================================
 
-# Server storage and logs (runtime data, uploaded files, per-user logs)
+# Server storage (runtime data, per-user directories, auth DB/keys)
 server/storage/
-server/logs/
 
-# Auth database and symmetric key (runtime and secrets)
-server_users.json
-auth_secret.key
-
-# Performance logs / Analysis outputs
+# Performance logs / analysis outputs (generated metrics)
 analysis/*.csv
 analysis/*.json
 analysis/*.log
@@ -38,6 +33,14 @@ secrets.json
 # System-specific hidden files
 .DS_Store
 Thumbs.db
+
+#### (Legacy) Ignored server files ####
+# (Legacy) Server logs (if logging is re-added later, not required)
+server/logs/
+
+# (Legacy) Auth database and symmetric key at root-level
+server_users.json
+auth_secret.key
 
 # ========================================================
 # GitHub Standard Python gitignore
