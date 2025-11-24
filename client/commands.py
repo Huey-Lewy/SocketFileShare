@@ -689,11 +689,9 @@ class ClientSession:
 
         print(f"[i] Receiving '{remote_name}' ({file_size} bytes) to '{local_target}'...")
 
-        # 3. Send READY acknowledgement
-        # This tells the server to start streaming the binary data.
+    
         self._sendline("READY")
 
-        # 4. Receive File Data
         received_bytes = 0
 
         try:
@@ -701,7 +699,7 @@ class ClientSession:
 
                 while received_bytes < file_size:
 
-                    # Calculate how much to read, limiting to the buffer size
+                  
 
                     to_read = min(BUFFER, file_size - received_bytes)
 
@@ -717,7 +715,7 @@ class ClientSession:
 
                     received_bytes += len(chunk)
 
-            # 5. Check final size and record metrics
+     
 
             duration = timer()
 
