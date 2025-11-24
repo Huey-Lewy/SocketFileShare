@@ -233,6 +233,8 @@ def handle_download(session, line, perf):
     """
     timer = timed()  # measure download handling time
 
+    sent_bytes = 0
+
     try:
         # Enforce that only authenticated clients can download files.
         if not getattr(session, "authenticated", False):
@@ -256,16 +258,54 @@ def handle_download(session, line, perf):
             print(f"[DOWNLOAD] failed: invalid path '{rel_path}'")
             return
 
-        print(f"[DOWNLOAD] stub: {rel_path} -> {target_path}")
 
+        if not os.path.isfile(target_path):
+            _send_line(session.conn, "ERR DOWNLOAD File not found")
+
+            print(f"[DOWNLOAD] failed: file not found at {target_path}")
+
+        file_size = os.path.getsize(target_path)
+
+        print ("[DONWLOAD] Preparing to send: {rel_path} ({file_size} bytes)...")
+
+        _send_line(session.conn, f"SIZE {file_size} bytes")
+
+        try:
+            resp = session.conn.recv(1024).decode(ENC).strip()
+            if resp != "READY":
+                print (f"[DONWLOAD] Client rejected transfer, or unexpected response: {resp}")
+                return
+
+        except Exception:
+            print ("[DOWNLOAD] Client disconnected or failed READY response.")
+            return
+
+        try:
+            with open (target_path, "rb") as f:
+                while True:
+
+                    chunk = f.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+
+                    session.conn.sendall(chunk)
+                    sent_bytes += len(chunk)
+            if sent_bytes >= file_size:
+                print(f"[DOWNLOAD] Warning: Sent size mismatch! Expected {file_size}, sent {sent_bytes}.")
+            else:
+                print(f"[DOWNLOAD] Success: {sent_bytes} bytes sent for '{rel_path}'")
+        except Exception as e:
+            print(f"[DOWNLOAD] Error: {e}")
+
+        '''
         # Placeholder: check if target_path exists.
         # Placeholder: send error response if file does not exist.
         # Placeholder: send file size first.
         # Placeholder: stream file contents from disk to client in CHUNK_SIZE chunks.
         # Placeholder: handle broken connections and partial sends.
         # Placeholder: record download status in any higher-level reporting if desired.
+        '''
 
-        _send_line(session.conn, "ERR DOWNLOAD Not implemented")
 
     finally:
         elapsed = timer()
