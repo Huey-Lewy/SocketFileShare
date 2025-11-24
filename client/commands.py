@@ -652,18 +652,86 @@ class ClientSession:
             return
 
         local_target = local_path if local_path else remote_name
-        print(f"[!] Download handler not implemented yet. Requested file: {remote_name}.")
+
 
         timer = timed()
         self._sendline(f"DOWNLOAD {remote_name}")
         # Placeholder: receive file size and file data, write to local_target.
         resp = self._readline()
-        duration = timer()
-        # Placeholder: replace bytes_count=0 with actual file size once implemented.
-        self.perf.record_transfer(operation="download", bytes_count=0, seconds=duration, source="client")
 
-        # Placeholder: handle server download status.
+        # Placeholder: replace bytes_count=0 with actual file size once implemented.
+
         if resp is None:
+
             print("[x] No response for DOWNLOAD.")
+
             return
-        print(f"[server] {resp}")
+
+
+
+        parts = resp.split()
+
+        if len(parts) != 2 or parts[0] != "SIZE":
+
+            print(f"[x] Server rejected download. Response: {resp}")
+
+            return
+
+        try:
+
+            file_size = int(parts[1])
+
+        except ValueError:
+
+            print(f"[x] Invalid file size received: {parts[1]}")
+
+            return
+
+        print(f"[i] Receiving '{remote_name}' ({file_size} bytes) to '{local_target}'...")
+
+        # 3. Send READY acknowledgement
+        # This tells the server to start streaming the binary data.
+        self._sendline("READY")
+
+        # 4. Receive File Data
+        received_bytes = 0
+
+        try:
+            with open(local_target, "wb") as f:
+
+                while received_bytes < file_size:
+
+                    # Calculate how much to read, limiting to the buffer size
+
+                    to_read = min(BUFFER, file_size - received_bytes)
+
+                    chunk = self.sock.recv(to_read)
+
+                    if not chunk:
+
+                        print("[x] Connection closed by server mid-transfer.")
+
+                        break
+
+                    f.write(chunk)
+
+                    received_bytes += len(chunk)
+
+            # 5. Check final size and record metrics
+
+            duration = timer()
+
+            self.perf.record_transfer(operation="download", bytes_count=received_bytes, seconds=duration, source="client")
+
+            if received_bytes == file_size:
+
+                print(f"[i] Download complete: {received_bytes} bytes written.")
+
+            else:
+
+                print(f"[x] Download incomplete! Expected {file_size} bytes, received {received_bytes} bytes.")
+
+        except Exception as e:
+
+            print(f"[x] Error receiving or writing file: {e}")
+
