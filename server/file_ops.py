@@ -318,14 +318,39 @@ def handle_dir(session, line, perf):
             print(f"[DIR] failed: invalid path '{rel_path}'")
             return
 
-        print(f"[DIR] stub: listing for {target_path}")
+        print(f"[DIR] listing for: {target_path}")
+
+        #Display all files and directories of the current directory
+        try:
+            #Get the names of all item in the current directory
+            contents = os.listdir(target_path)
+
+            _send_line(session.conn, "BEGIN")
+
+            for item in contents:
+                #Get the full path to the item
+                full_path = os.path.join(target_path, item)
+                #If the item is a directory
+                if os.path.isdir(full_path):
+                    print(f"[DIR] sending DIR: {item}")
+                    _send_line(session.conn, f"  [DIR] {item}")
+                #If item not a directory, assume that it is a file
+                else:
+                    print(f"[DIR] sending FILE: {item}") 
+                    _send_line(session.conn, f"  [FILE] {item}")
+            
+            _send_line(session.conn, "END")
+
+        except FileNotFoundError:
+            _send_line(session.conn, f"ERR Directory not found at '{target_path}'")
+        except Exception as e:
+            _send_line(session.conn, f"ERR: {e}")
 
         # Placeholder: read entries under target_path (files and subfolders).
         # Placeholder: format entries as a simple list (one item per line).
         # Placeholder: send listing to client, possibly with a BEGIN/END marker.
         # Placeholder: record directory listing status in any higher-level reporting.
 
-        _send_line(session.conn, "ERR DIR Not implemented")
 
     finally:
         elapsed = timer()

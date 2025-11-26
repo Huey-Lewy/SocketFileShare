@@ -483,7 +483,12 @@ class ClientSession:
             print("[!] Authenticate before using DIR.")
             return
 
-        line = "DIR" if not path else f"DIR {path}"
+        # line = "DIR" if not path else f"DIR {path}"
+        if path is None or path == ".":
+            line = "DIR"
+        else:
+            line = f"DIR {path}"
+
         timer = timed()
         self._sendline(line)
         resp = self._readline()
@@ -494,8 +499,26 @@ class ClientSession:
         if resp is None:
             print("[x] No response for DIR.")
             return
-        print(f"[server] {resp}")
+        
+        # If only an error, print and return
+        if resp.startswith("ERR"):
+            print(f"[server] {resp}")
+            return
 
+        # Handle multi-line listing
+        if resp == "BEGIN":
+            print("Directory listing: ")
+            while True:
+                line = self._readline()
+                if line is None:
+                    print("[x] Server closed connection unexpectedly.")
+                    break
+                if line.strip() == "END":
+                    break
+                print(f"  {line}")
+        else:
+            print(f"[server] {resp}")
+     
     def delete(self, remote_path):
         """
         Request deletion of a remote file via the DELETE command.
