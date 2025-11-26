@@ -261,6 +261,7 @@ def handle_delete(session, line, perf):
             print("[DELETE] failed: bad syntax")
             return
 
+        # Ignore the command keyword part [0], Save the relative path to delete part[1]
         _, rel_path = parts[0], parts[1]
 
         # Resolve the path within the user's storage.
@@ -279,7 +280,34 @@ def handle_delete(session, line, perf):
         # Placeholder: send success or error response to client.
         # Placeholder: record delete status in any higher-level reporting if desired.
 
-        _send_line(session.conn, "ERR DELETE Not implemented")
+        
+
+        # Check if file exists; send error if missing.
+        if not os.path.exists(target_path):
+            _send_line(session.conn, f"ERR DELETE File not found: {rel_path}")
+            print(f"[DELETE] failed: file not found '{target_path}'")
+            return
+        # Remove the file 
+        try:
+            #If target item is a directory
+            if os.path.isdir(target_path):
+                os.rmdir(target_path)  
+            #If target item is a file
+            else:
+                os.remove(target_path) 
+            
+            #Send confirmation response to client
+            _send_line(session.conn, f"OK DELETE {rel_path}")
+            #Display deletion confirmation on server side
+            print(f"[DELETE] success: {target_path}")
+
+        except Exception as e:
+            _send_line(session.conn, f"ERR DELETE Failed to remove: {rel_path}")
+            print(f"[DELETE] error deleting '{target_path}': {e}")
+
+        
+        # Placeholder: record delete status in any higher-level reporting if desired.
+
 
     finally:
         elapsed = timer()
@@ -318,13 +346,19 @@ def handle_dir(session, line, perf):
             print(f"[DIR] failed: invalid path '{rel_path}'")
             return
 
+        # Placeholder: read entries under target_path (files and subfolders).
+        # Placeholder: format entries as a simple list (one item per line).
+        # Placeholder: send listing to client, possibly with a BEGIN/END marker.
+        # Placeholder: record directory listing status in any higher-level reporting.
+        
         print(f"[DIR] listing for: {target_path}")
 
         #Display all files and directories of the current directory
         try:
-            #Get the names of all item in the current directory
+            #Read entries under target_path (files and subfolders).
             contents = os.listdir(target_path)
 
+            #Send listing to client
             _send_line(session.conn, "BEGIN")
 
             for item in contents:
@@ -332,11 +366,11 @@ def handle_dir(session, line, perf):
                 full_path = os.path.join(target_path, item)
                 #If the item is a directory
                 if os.path.isdir(full_path):
-                    print(f"[DIR] sending DIR: {item}")
+                    # print(f"[DIR] sending DIR: {item}")
                     _send_line(session.conn, f"  [DIR] {item}")
                 #If item not a directory, assume that it is a file
                 else:
-                    print(f"[DIR] sending FILE: {item}") 
+                    # print(f"[DIR] sending FILE: {item}") 
                     _send_line(session.conn, f"  [FILE] {item}")
             
             _send_line(session.conn, "END")
@@ -346,10 +380,6 @@ def handle_dir(session, line, perf):
         except Exception as e:
             _send_line(session.conn, f"ERR: {e}")
 
-        # Placeholder: read entries under target_path (files and subfolders).
-        # Placeholder: format entries as a simple list (one item per line).
-        # Placeholder: send listing to client, possibly with a BEGIN/END marker.
-        # Placeholder: record directory listing status in any higher-level reporting.
 
 
     finally:
