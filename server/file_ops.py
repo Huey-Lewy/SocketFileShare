@@ -374,12 +374,70 @@ def handle_subfolder(session, line, perf):
 
         print(f"[SUBFOLDER] stub: {action} {rel_path} -> {target_path}")
 
-        # Placeholder: create directory tree at target_path when action is 'create'.
-        # Placeholder: delete directory at target_path when action is 'delete', with safety checks.
-        # Placeholder: send success or error response to client.
-        # Placeholder: record subfolder operation status in any higher-level reporting.
+        # create directory tree at target_path when action is 'create'.
+        if action == "create":
+            if os.path.exists(target_path):
+                if os.path.isdir(target_path):
+                    #Directory Already Exists
+                    _send_line(session.conn, "ERR SUBFOLDER Directory already exists")
+                    print(f"[SUBFOLDER] create failed: directory already exists {target_path}")
+                else:
+                    # A file with the same name as the folder exists at that path
+                    _send_line(session.conn, "ERR SUBFOLDER A file with the same name exists at that path")
+                    print(f"[SUBFOLDER] create failed: file exists at {target_path}")
+                return
 
-        _send_line(session.conn, "ERR SUBFOLDER Not implemented")
+            try:
+                os.makedirs(target_path, exist_ok=True)
+                #make the directory
+            except OSError as exc:
+                #Handling any problems while creating file
+                _send_line(session.conn, "ERR SUBFOLDER Failed to create directory")
+                print(f"[SUBFOLDER] create failed: OSERROR")
+                return
+            #send response to client
+            _send_line(session.conn, "SUBFOLDER Directory created!")
+            print(f"[SUBFOLDER] created '{target_path}'")
+            return
+
+        # Placeholder: delete directory at target_path when action is 'delete', with safety checks.
+        elif action == "delete":
+            if not os.path.exists(target_path):
+                # if path does not exist
+                _send_line(session.conn, "ERR SUBFOLDER Directory does not exist")
+                print(f"[SUBFOLDER] delete failed: directory does not exist {target_path}")
+                return
+
+            if not os.path.isdir(target_path):
+                # if it is not a directory
+                _send_line(session.conn, "ERR SUBFOLDER Target is not directory")
+                print(f"[SUBFOLDER] delete failed: target is not a directory {target_path}")
+                return
+
+            try:
+                #Check if directory has contents inside it(more directories or files)
+                if os.listdir(target_path):
+                    _send_line(session.conn, "ERR SUBFOLDER Directory is not empty")
+                    print(f"[SUBFOLDER] delete failed: directory is not empty {target_path}")
+                    return
+            except OSError as e:
+                _send_line(session.conn, "ERR SUBFOLDER Cannot inspect directory")
+                print(f"[SUBFOLDER] delete failed: OS ERROR {e}")
+                return
+
+            try:
+                #actually remove the directory
+                os.rmdir(target_path)
+            except OSError as e:
+                _send_line(session.conn, "ERR SUBFOLDER Failed to delete directory")
+                print(f"[SUBFOLDER] delete failed while removing directory: {e}")
+                return
+                #send response to client
+            _send_line(session.conn, "SUBFOLDER Directory deleted!")
+            print(f"[SUBFOLDER] deleted {target_path}")
+            return
+
+        # Placeholder: record subfolder operation status in any higher-level reporting.
 
     finally:
         elapsed = timer()
