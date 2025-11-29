@@ -288,12 +288,9 @@ def handle_delete(session, line, perf):
             print(f"[DELETE] failed: file not found '{target_path}'")
             return
         # Remove the file 
-        try:
-            #If target item is a directory
-            if os.path.isdir(target_path):
-                os.rmdir(target_path)  
+        try: 
             #If target item is a file
-            else:
+            if os.path.isfile(target_path):
                 os.remove(target_path) 
             
             #Send confirmation response to client
