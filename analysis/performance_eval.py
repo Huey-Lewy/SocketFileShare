@@ -4,6 +4,7 @@
 import time         # high-resolution timing
 import threading    # thread-safe metrics
 import csv          # CSV export of metrics for offline analysis
+import json         # serialize metadata for CSV storage
 
 #### Simple Timer ####
 def timed():
@@ -47,7 +48,7 @@ class PerfRecorder:
           Label for origin, e.g. 'server' or 'client'
       - timestamp: float
           UNIX timestamp (seconds since epoch)
-      - meta: dict (optional)
+      - meta: dict or other (optional)
           Extra context (e.g., filename, command name, user_id)
     """
 
@@ -76,7 +77,7 @@ class PerfRecorder:
             bytes_count (int): Bytes transferred during the operation.
             seconds   (float): Duration in seconds.
             source     (str): Label for origin, e.g. 'server' or 'client'.
-            meta       (dict|None): Optional extra info (e.g., filename).
+            meta       (dict|any|None): Optional extra info (e.g., filename).
 
         This is designed to be called from:
           - server.file_ops.handle_upload / handle_download
@@ -107,8 +108,11 @@ class PerfRecorder:
         }
 
         if meta is not None:
-            # Placeholder: attach helpful labels such as filenames, user_id, or remote path.
-            record["meta"] = dict(meta)
+            # Copy dict metadata or store other types as-is for later export.
+            if isinstance(meta, dict):
+                record["meta"] = dict(meta)
+            else:
+                record["meta"] = meta
 
         # Store this transfer measurement for later offline analysis.
         self._add_record(record)
@@ -123,7 +127,7 @@ class PerfRecorder:
                              'client_session'.
             seconds (float): Duration in seconds.
             source   (str): Label for origin, e.g. 'server' or 'client'.
-            meta     (dict|None): Optional extra info (e.g., command name).
+            meta     (dict|any|None): Optional extra info (e.g., command name).
 
         Typical usage:
           - After auth handshake completes (server side):  operation='auth'
@@ -141,8 +145,11 @@ class PerfRecorder:
         }
 
         if meta is not None:
-            # Placeholder: add extra context such as username or remote address.
-            record["meta"] = dict(meta)
+            # Copy dict metadata or store other types as-is for later export.
+            if isinstance(meta, dict):
+                record["meta"] = dict(meta)
+            else:
+                record["meta"] = meta
 
         # Store this response-time measurement for offline analysis.
         self._add_record(record)
@@ -181,8 +188,8 @@ class PerfRecorder:
         The CSV will contain one row per record, with columns including:
             operation, bytes, seconds, rate_MBps, source, timestamp, meta
 
-        The 'meta' column (if present) will be a string representation of
-        whatever extra data was attached when the record was created.
+        The 'meta' column (if present) will be stored as a string so tools
+        can parse it later (for example, JSON if it started as a dict).
         """
         data = self.snapshot()
 
@@ -190,7 +197,7 @@ class PerfRecorder:
         if not data:
             fieldnames = ["operation", "bytes", "seconds", "rate_MBps", "source", "timestamp", "meta"]
         else:
-            # Collect union of keys across all records so we don't lose any fields.
+            # Collect the union of keys across all records to avoid dropping any fields.
             fieldnames = set()
             for rec in data:
                 fieldnames.update(rec.keys())
@@ -200,5 +207,15 @@ class PerfRecorder:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             for rec in data:
-                # Placeholder: if 'meta' is a dict, it will be written as its string representation.
-                writer.writerow(rec)
+                # Create a shallow copy to allow field adjustments before writing to CSV.
+                row = dict(rec)
+
+                # Convert dict metadata to a JSON string for easier offline parsing.
+                if "meta" in row and isinstance(row["meta"], dict):
+                    try:
+                        row["meta"] = json.dumps(row["meta"], sort_keys=True)
+                    except TypeError:
+                        # Fallback to plain string if JSON encoding fails.
+                        row["meta"] = str(row["meta"])
+
+                writer.writerow(row)

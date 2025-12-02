@@ -11,11 +11,11 @@ from analysis.performance_eval import PerfRecorder, timed   # client-side sessio
 USAGE = (
     "Commands:\n"
     "  passwd                            Change your password\n"
-    "  upload <local_path> [remote]      Upload a file (stub)\n"
-    "  download <remote> [local]         Download a file (stub)\n"
-    "  delete <remote_path>              Delete a file (stub)\n"
-    "  dir [subpath]                     List directory (stub)\n"
-    "  subfolder <create|delete> <path>  Manage subfolders (stub)\n"
+    "  upload <local_path> [remote]      Upload a file\n"
+    "  download <remote> [local]         Download a file\n"
+    "  delete <remote_path>              Delete a file\n"
+    "  dir [subpath]                     List directory\n"
+    "  subfolder <create|delete> <path>  Manage subfolders\n"
     "  admin-adduser <user> <role>       Add a user (admin)\n"
     "  admin-deluser <user>              Delete a user (admin)\n"
     "  admin-setrole <user> <role>       Change a user's role (admin)\n"
@@ -78,7 +78,7 @@ def _initial_auth(session):
 
         print("---- Login ----")
 
-        # Ask for username and ensure it is not empty.
+        # Ask for username and make sure it is not empty.
         username = input("user: ").strip()
         if not username:
             print("[x] Username cannot be empty.")
@@ -224,7 +224,7 @@ def _dispatch(session, line):
         _handle_passwd(session)
         return True
 
-    # Upload file (stub; real transfer logic in ClientSession.upload).
+    # Upload file.
     if cmd == "upload":
         if len(parts) >= 2:
             local_path = parts[1]
@@ -234,7 +234,7 @@ def _dispatch(session, line):
             print("Use: upload <local_path> [remote]")
         return True
 
-    # Download file (stub; real transfer logic in ClientSession.download).
+    # Download file.
     if cmd == "download":
         if len(parts) >= 2:
             remote_name = parts[1]
@@ -244,7 +244,7 @@ def _dispatch(session, line):
             print("Use: download <remote> [local]")
         return True
 
-    # Delete file (stub; real logic in ClientSession.delete).
+    # Delete file.
     if cmd == "delete":
         if len(parts) == 2:
             session.delete(parts[1])
@@ -252,13 +252,13 @@ def _dispatch(session, line):
             print("Use: delete <remote_path>")
         return True
 
-    # Directory listing (stub; real logic in ClientSession.dir_list).
+    # Directory listing.
     if cmd == "dir":
         subpath = parts[1] if len(parts) >= 2 else None
         session.dir_list(subpath)
         return True
 
-    # Subfolder create/delete (stub; real logic in ClientSession.subfolder).
+    # Subfolder create/delete.
     if cmd == "subfolder":
         if len(parts) >= 3:
             action = parts[1].lower()

@@ -2,7 +2,8 @@
 # Handles file operations for upload, download, delete, directory listing, and subfolder management.
 
 import os       # storage paths and filesystem work
-from analysis.performance_eval import timed     # timing for file operations
+import threading
+from analysis.performance_eval import timed  # timing for file operations
 
 #### Paths and constants ####
 ENC = "utf-8"
@@ -15,6 +16,60 @@ STORAGE_ROOT = os.path.join(BASE_DIR, "storage")
 # Suggested chunk size for streaming large files (upload/download).
 CHUNK_SIZE = 64 * 1024  # 64 KB
 
+# Track files currently being processed (uploads/downloads/deletes).
+_BUSY_LOCK = threading.Lock()
+_BUSY_PATHS = set()
+
+
+def _mark_busy(path):
+    """
+    Mark a path as busy.
+
+    Returns:
+        bool: True if the path was free and is now marked busy.
+              False if it was already busy.
+    """
+    abs_path = os.path.abspath(path)
+    with _BUSY_LOCK:
+        if abs_path in _BUSY_PATHS:
+            return False
+        _BUSY_PATHS.add(abs_path)
+        return True
+
+
+def _clear_busy(path):
+    """Remove a path from the busy set."""
+    abs_path = os.path.abspath(path)
+    with _BUSY_LOCK:
+        _BUSY_PATHS.discard(abs_path)
+
+
+def _recv_line(conn, max_bytes=4096):
+    """
+    Read a single line (terminated by '\n') from a socket.
+
+    Returns:
+        str or None: Line without trailing newline, or None if connection closed.
+    """
+    buf = bytearray()
+    while len(buf) < max_bytes:
+        chunk = conn.recv(1024)
+        if not chunk:
+            if not buf:
+                return None
+            break
+        buf.extend(chunk)
+        if b"\n" in chunk:
+            break
+
+    if not buf:
+        return None
+    if len(buf) >= max_bytes and b"\n" not in buf:
+        raise ValueError("Line too long")
+
+    line, _, _ = buf.partition(b"\n")
+    return line.decode(ENC, errors="replace").strip()
+
 #### Path helpers ####
 def _make_dirs(path):
     """
@@ -25,13 +80,15 @@ def _make_dirs(path):
     if not os.path.exists(path):
         os.makedirs(path, exist_ok=True)
 
+
 def init_storage_root():
     """
-    Initialize that the global storage root exists.
+    Make sure the global storage root exists.
 
     main.py or server_main.py should call this during server bootstrap.
     """
     _make_dirs(STORAGE_ROOT)
+
 
 def get_user_storage_dir(user_id, username):
     """
@@ -59,9 +116,10 @@ def get_user_storage_dir(user_id, username):
     # NOTE: If usernames may contain path-unsafe chars, a sanitization step can be added here.
     return os.path.abspath(os.path.join(STORAGE_ROOT, folder_name))
 
+
 def init_user_storage_dir(user_id, username):
     """
-    Initialize a user's storage directory exists and return its path.
+    Make sure a user's storage directory exists and return its path.
 
     Parameters:
         user_id  (str): Numeric ID from auth (e.g., "0001").
@@ -73,6 +131,7 @@ def init_user_storage_dir(user_id, username):
     user_dir = get_user_storage_dir(user_id, username)
     _make_dirs(user_dir)
     return user_dir
+
 
 def resolve_path(session, rel_path):
     """
@@ -89,7 +148,7 @@ def resolve_path(session, rel_path):
     Raises:
         ValueError: If the resolved path is outside the storage root, or invalid.
     """
-    # Initialize storage_root is absolute to avoid surprises.
+    # Initialize storage_root as absolute to avoid surprises.
     base = os.path.abspath(session.storage_root)
     target = os.path.abspath(os.path.join(base, rel_path))
 
@@ -104,6 +163,7 @@ def resolve_path(session, rel_path):
         raise ValueError("Path outside storage root")
 
     return target
+
 
 def _send_line(conn, text):
     """
@@ -121,20 +181,27 @@ def handle_upload(session, line, perf):
     """
     Handle file upload request from a client.
 
-    Protocol (proposed):
+    Protocol:
         UPLOAD <remote_path> <size_bytes>
 
     Where:
         remote_path: Path relative to the user's storage root.
         size_bytes:  Decimal size of the file in bytes.
 
-    The actual file data transfer will be implemented by teammates.
+    Overwrite handling:
+        - If file exists:
+            server:  "EXISTS UPLOAD <remote_path>"
+            client:  "OVERWRITE" or "SKIP"
+
+        - If "SKIP":
+            server:  "OK UPLOAD SKIPPED <remote_path>"
     """
     timer = timed()  # measure upload handling time
     received_bytes = 0
+    target_path = None
 
     try:
-        # Enforce that only authenticated clients can upload files.
+        # Only authenticated clients can upload files.
         if not getattr(session, "authenticated", False):
             _send_line(session.conn, "ERR UPLOAD Not authenticated")
             print("[UPLOAD] denied: client not authenticated")
@@ -167,9 +234,39 @@ def handle_upload(session, line, perf):
             print(f"[UPLOAD] failed: invalid path '{rel_path}'")
             return
 
+        # Reserve this path so no other operation touches it at the same time.
+        if not _mark_busy(target_path):
+            _send_line(session.conn, "ERR UPLOAD File is in use")
+            print(f"[UPLOAD] failed: file in use '{target_path}'")
+            return
+
         # Create parent directories if needed.
         parent_dir = os.path.dirname(target_path)
         _make_dirs(parent_dir)
+
+        # If the path points to a directory, reject.
+        if os.path.isdir(target_path):
+            _send_line(session.conn, "ERR UPLOAD Target is a directory")
+            print(f"[UPLOAD] failed: target is directory '{target_path}'")
+            return
+
+        # Overwrite prompt if file already exists.
+        if os.path.exists(target_path):
+            _send_line(session.conn, f"EXISTS UPLOAD {rel_path}")
+            resp = _recv_line(session.conn)
+            if resp is None:
+                print("[UPLOAD] client disconnected during overwrite prompt")
+                return
+
+            resp = resp.strip().upper()
+            if resp == "SKIP":
+                _send_line(session.conn, f"OK UPLOAD SKIPPED {rel_path}")
+                print(f"[UPLOAD] client skipped overwrite for '{target_path}'")
+                return
+            if resp != "OVERWRITE":
+                _send_line(session.conn, "ERR UPLOAD Invalid overwrite response")
+                print(f"[UPLOAD] failed: unexpected overwrite reply '{resp}'")
+                return
 
         print(f"[UPLOAD] Starting: {rel_path} ({file_size} bytes) -> {target_path}")
 
@@ -199,29 +296,39 @@ def handle_upload(session, line, perf):
 
     except Exception as e:
         print(f"[UPLOAD] Critical error: {e}")
-        _send_line(session.conn, "ERR UPLOAD Internal error")
+        try:
+            _send_line(session.conn, "ERR UPLOAD Internal error")
+        except Exception:
+            pass
 
     finally:
+        if target_path is not None:
+            _clear_busy(target_path)
         elapsed = timer()
         perf.record_transfer(operation="upload", bytes_count=received_bytes, seconds=elapsed, source="server")
+
 
 def handle_download(session, line, perf):
     """
     Handle file download request from a client.
 
-    Protocol (proposed):
+    Protocol:
         DOWNLOAD <remote_path>
 
     Where:
         remote_path: Path relative to the user's storage root.
 
-    The actual file streaming logic will be implemented by teammates.
+    Steps:
+        - Server sends:  "SIZE <file_size>"
+        - Client sends:  "READY"
+        - Server streams raw bytes.
     """
     timer = timed()  # measure download handling time
     sent_bytes = 0
+    target_path = None
 
     try:
-        # Enforce that only authenticated clients can download files.
+        # Only authenticated clients can download files.
         if not getattr(session, "authenticated", False):
             _send_line(session.conn, "ERR DOWNLOAD Not authenticated")
             print("[DOWNLOAD] denied: client not authenticated")
@@ -243,9 +350,20 @@ def handle_download(session, line, perf):
             print(f"[DOWNLOAD] failed: invalid path '{rel_path}'")
             return
 
-        if not os.path.isfile(target_path):
+        # Reserve file for this transfer.
+        if not _mark_busy(target_path):
+            _send_line(session.conn, "ERR DOWNLOAD File is in use")
+            print(f"[DOWNLOAD] failed: file in use '{target_path}'")
+            return
+
+        if not os.path.exists(target_path):
             _send_line(session.conn, "ERR DOWNLOAD File not found")
             print(f"[DOWNLOAD] failed: file not found at {target_path}")
+            return
+
+        if not os.path.isfile(target_path):
+            _send_line(session.conn, "ERR DOWNLOAD Target is not a file")
+            print(f"[DOWNLOAD] failed: target is not a file '{target_path}'")
             return
 
         file_size = os.path.getsize(target_path)
@@ -257,12 +375,12 @@ def handle_download(session, line, perf):
 
         # Wait for client READY
         try:
-            resp = session.conn.recv(1024).decode(ENC).strip()
+            resp = _recv_line(session.conn)
             if resp != "READY":
                 print(f"[DOWNLOAD] Client rejected transfer or sent unexpected response: {resp}")
                 return
-        except Exception:
-            print("[DOWNLOAD] Client disconnected or failed READY response.")
+        except Exception as e:
+            print(f"[DOWNLOAD] Client READY failed: {e}")
             return
 
         try:
@@ -282,23 +400,28 @@ def handle_download(session, line, perf):
             print(f"[DOWNLOAD] Error: {e}")
 
     finally:
+        if target_path is not None:
+            _clear_busy(target_path)
         elapsed = timer()
         perf.record_transfer(operation="download", bytes_count=sent_bytes, seconds=elapsed, source="server")
+
 
 def handle_delete(session, line, perf):
     """
     Handle delete request from a client.
 
-    Protocol (proposed):
+    Protocol:
         DELETE <remote_path>
 
     Where:
         remote_path: Path relative to the user's storage root.
     """
     timer = timed()  # measure delete handling time
+    target_path = None
+    rel_path = None
 
     try:
-        # Enforce that only authenticated clients can delete files.
+        # Only authenticated clients can delete files.
         if not getattr(session, "authenticated", False):
             _send_line(session.conn, "ERR DELETE Not authenticated")
             print("[DELETE] denied: client not authenticated")
@@ -310,7 +433,6 @@ def handle_delete(session, line, perf):
             print("[DELETE] failed: bad syntax")
             return
 
-        # Ignore the command keyword part [0], Save the relative path to delete part[1]
         _, rel_path = parts[0], parts[1]
 
         # Resolve the path within the user's storage.
@@ -321,59 +443,63 @@ def handle_delete(session, line, perf):
             print(f"[DELETE] failed: invalid path '{rel_path}'")
             return
 
-        print(f"[DELETE] stub: {rel_path} -> {target_path}")
+        # Reserve file for deletion; if it is already in use, reject.
+        if not _mark_busy(target_path):
+            _send_line(session.conn, "ERR DELETE File is in use")
+            print(f"[DELETE] failed: file in use '{target_path}'")
+            return
 
-        # Placeholder: check if target_path is in use by another transfer; send error if busy.
-        # Placeholder: check if file exists; send error if missing.
-        # Placeholder: remove the file from disk.
-        # Placeholder: send success or error response to client.
-        # Placeholder: record delete status in any higher-level reporting if desired.
-
-        
+        print(f"[DELETE] request for: {rel_path} -> {target_path}")
 
         # Check if file exists; send error if missing.
         if not os.path.exists(target_path):
             _send_line(session.conn, f"ERR DELETE File not found: {rel_path}")
             print(f"[DELETE] failed: file not found '{target_path}'")
             return
-        # Remove the file 
-        try: 
-            #If target item is a file
-            if os.path.isfile(target_path):
-                os.remove(target_path) 
-            
-            #Send confirmation response to client
-            _send_line(session.conn, f"OK DELETE {rel_path}")
-            #Display deletion confirmation on server side
-            print(f"[DELETE] success: {target_path}")
 
+        # Reject directory deletion here; subfolder removal is handled by SUBFOLDER.
+        if not os.path.isfile(target_path):
+            _send_line(session.conn, "ERR DELETE Target is not a file")
+            print(f"[DELETE] failed: target is not a file '{target_path}'")
+            return
+
+        # Remove the file.
+        try:
+            os.remove(target_path)
+            _send_line(session.conn, f"OK DELETE {rel_path}")
+            print(f"[DELETE] success: {target_path}")
         except Exception as e:
             _send_line(session.conn, f"ERR DELETE Failed to remove: {rel_path}")
             print(f"[DELETE] error deleting '{target_path}': {e}")
 
-        
-        # Placeholder: record delete status in any higher-level reporting if desired.
-
-
     finally:
+        if target_path is not None:
+            _clear_busy(target_path)
         elapsed = timer()
         perf.record_response(operation="delete", seconds=elapsed, source="server")
+
 
 def handle_dir(session, line, perf):
     """
     Handle directory listing request from a client.
 
-    Protocol (proposed):
+    Protocol:
         DIR
         DIR <subpath>
 
     Where:
         subpath: Optional relative subdirectory under the user's storage root.
+
+    Response:
+        BEGIN
+          [DIR] name
+          [FILE] name
+        END
     """
     timer = timed()  # measure dir handling time
 
     try:
-        # Enforce that only authenticated clients can view directory listings.
+        # Only authenticated clients can view directory listings.
         if not getattr(session, "authenticated", False):
             _send_line(session.conn, "ERR DIR Not authenticated")
             print("[DIR] denied: client not authenticated")
@@ -392,51 +518,50 @@ def handle_dir(session, line, perf):
             print(f"[DIR] failed: invalid path '{rel_path}'")
             return
 
-        # Placeholder: read entries under target_path (files and subfolders).
-        # Placeholder: format entries as a simple list (one item per line).
-        # Placeholder: send listing to client, possibly with a BEGIN/END marker.
-        # Placeholder: record directory listing status in any higher-level reporting.
-        
         print(f"[DIR] listing for: {target_path}")
 
-        #Display all files and directories of the current directory
+        if not os.path.exists(target_path):
+            _send_line(session.conn, f"ERR DIR Path not found: {rel_path}")
+            print(f"[DIR] failed: path not found '{target_path}'")
+            return
+
+        if not os.path.isdir(target_path):
+            _send_line(session.conn, "ERR DIR Target is not a directory")
+            print(f"[DIR] failed: target is not a directory '{target_path}'")
+            return
+
         try:
-            #Read entries under target_path (files and subfolders).
             contents = os.listdir(target_path)
 
-            #Send listing to client
+            # Send listing to client
             _send_line(session.conn, "BEGIN")
 
             for item in contents:
-                #Get the full path to the item
                 full_path = os.path.join(target_path, item)
-                #If the item is a directory
                 if os.path.isdir(full_path):
-                    # print(f"[DIR] sending DIR: {item}")
-                    _send_line(session.conn, f"  [DIR] {item}")
-                #If item not a directory, assume that it is a file
+                    _send_line(session.conn, f"[DIR] {item}")
                 else:
-                    # print(f"[DIR] sending FILE: {item}") 
-                    _send_line(session.conn, f"  [FILE] {item}")
-            
+                    _send_line(session.conn, f"[FILE] {item}")
+
             _send_line(session.conn, "END")
 
-        except FileNotFoundError:
-            _send_line(session.conn, f"ERR Directory not found at '{target_path}'")
+        except OSError as e:
+            _send_line(session.conn, "ERR DIR Failed to read directory")
+            print(f"[DIR] OS error reading '{target_path}': {e}")
         except Exception as e:
-            _send_line(session.conn, f"ERR: {e}")
-
-
+            _send_line(session.conn, "ERR DIR Internal error")
+            print(f"[DIR] Unexpected error listing '{target_path}': {e}")
 
     finally:
         elapsed = timer()
         perf.record_response(operation="dir", seconds=elapsed, source="server")
 
+
 def handle_subfolder(session, line, perf):
     """
     Handle subfolder management request (create/delete).
 
-    Protocol (proposed):
+    Protocol:
         SUBFOLDER create <path>
         SUBFOLDER delete <path>
 
@@ -446,7 +571,7 @@ def handle_subfolder(session, line, perf):
     timer = timed()  # measure subfolder handling time
 
     try:
-        # Enforce that only authenticated clients can manage subfolders.
+        # Only authenticated clients can manage subfolders.
         if not getattr(session, "authenticated", False):
             _send_line(session.conn, "ERR SUBFOLDER Not authenticated")
             print("[SUBFOLDER] denied: client not authenticated")
@@ -473,72 +598,61 @@ def handle_subfolder(session, line, perf):
             print(f"[SUBFOLDER] failed: invalid path '{rel_path}'")
             return
 
-        print(f"[SUBFOLDER] stub: {action} {rel_path} -> {target_path}")
+        print(f"[SUBFOLDER] {action} {rel_path} -> {target_path}")
 
-        # create directory tree at target_path when action is 'create'.
         if action == "create":
             if os.path.exists(target_path):
                 if os.path.isdir(target_path):
-                    #Directory Already Exists
                     _send_line(session.conn, "ERR SUBFOLDER Directory already exists")
                     print(f"[SUBFOLDER] create failed: directory already exists {target_path}")
                 else:
-                    # A file with the same name as the folder exists at that path
                     _send_line(session.conn, "ERR SUBFOLDER A file with the same name exists at that path")
                     print(f"[SUBFOLDER] create failed: file exists at {target_path}")
                 return
 
             try:
                 os.makedirs(target_path, exist_ok=True)
-                #make the directory
-            except OSError as exc:
-                #Handling any problems while creating file
+            except OSError:
                 _send_line(session.conn, "ERR SUBFOLDER Failed to create directory")
-                print(f"[SUBFOLDER] create failed: OSERROR")
+                print(f"[SUBFOLDER] create failed: OS error at {target_path}")
                 return
-            #send response to client
-            _send_line(session.conn, "SUBFOLDER Directory created!")
+
+            _send_line(session.conn, f"OK SUBFOLDER CREATE {rel_path}")
             print(f"[SUBFOLDER] created '{target_path}'")
             return
 
-        # Placeholder: delete directory at target_path when action is 'delete', with safety checks.
         elif action == "delete":
             if not os.path.exists(target_path):
-                # if path does not exist
                 _send_line(session.conn, "ERR SUBFOLDER Directory does not exist")
                 print(f"[SUBFOLDER] delete failed: directory does not exist {target_path}")
                 return
 
             if not os.path.isdir(target_path):
-                # if it is not a directory
                 _send_line(session.conn, "ERR SUBFOLDER Target is not directory")
                 print(f"[SUBFOLDER] delete failed: target is not a directory {target_path}")
                 return
 
             try:
-                #Check if directory has contents inside it(more directories or files)
+                # Check if directory has contents inside it.
                 if os.listdir(target_path):
                     _send_line(session.conn, "ERR SUBFOLDER Directory is not empty")
                     print(f"[SUBFOLDER] delete failed: directory is not empty {target_path}")
                     return
             except OSError as e:
                 _send_line(session.conn, "ERR SUBFOLDER Cannot inspect directory")
-                print(f"[SUBFOLDER] delete failed: OS ERROR {e}")
+                print(f"[SUBFOLDER] delete failed: OS error {e}")
                 return
 
             try:
-                #actually remove the directory
                 os.rmdir(target_path)
             except OSError as e:
                 _send_line(session.conn, "ERR SUBFOLDER Failed to delete directory")
                 print(f"[SUBFOLDER] delete failed while removing directory: {e}")
                 return
-                #send response to client
-            _send_line(session.conn, "SUBFOLDER Directory deleted!")
+
+            _send_line(session.conn, f"OK SUBFOLDER DELETE {rel_path}")
             print(f"[SUBFOLDER] deleted {target_path}")
             return
-
-        # Placeholder: record subfolder operation status in any higher-level reporting.
 
     finally:
         elapsed = timer()

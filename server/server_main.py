@@ -1,6 +1,7 @@
 # server/server_main.py
 # Starts the multithreaded server application and dispatches client commands.
 
+import os                           # paths for metrics export
 import socket                       # TCP server sockets
 import threading                    # per-client threads
 from cryptography.fernet import InvalidToken      # decrypt error type for PASSWD/ADMIN
@@ -12,6 +13,9 @@ from server import auth             # login, users, and roles
 BUFFER = 64 * 1024  # 64KB buffer size (reserved for future use)
 ENC = "utf-8"       # Encoding format for text commands
 BACKLOG = 5         # Max queued connections
+
+# Path to CSV metrics file under the server storage root.
+METRICS_FILE = os.path.join(file_ops.STORAGE_ROOT, "server_metrics.csv")
 
 #### Global performance recorder ####
 # Shared across all client handler threads.
@@ -69,7 +73,7 @@ def _prompt_server_config():
 #### Socket helpers ####
 def _recv_line(conn, max_bytes=4096):
     """
-    Read a single line (terminated by '\\n') from a socket.
+    Read a single line (terminated by '\n') from a socket.
 
     This helper is used after authentication for command traffic.
     It protects against partial reads and overly long input.
@@ -106,7 +110,7 @@ def _recv_line(conn, max_bytes=4096):
 
 def _send_line(conn, text):
     """
-    Send a single line to the client, appending '\\n'.
+    Send a single line to the client, appending '\n'.
     """
     data = (text.rstrip("\n") + "\n").encode(ENC)
     conn.sendall(data)
@@ -467,10 +471,10 @@ def main():
       - Accept clients on a listening socket and spawn a thread per client.
       - Record total server uptime for performance analysis.
     """
-    # Initialize authentication storage (user DB and secret key) exists before serving.
+    # Initialize authentication storage (user DB and secret key) before serving.
     auth.init_auth_store()
 
-    # Optionally init the global storage root exists.
+    # Init the global storage root.
     # Per-user folders are created lazily by init_user_storage_dir().
     file_ops.init_storage_root()
 
@@ -520,8 +524,15 @@ def main():
         server_sock.close()
         uptime = start_timer()
         perf.record_response(operation="server_uptime", seconds=uptime, source="server")
-        print(f"[i] Server stopped. Total runtime: {uptime:.2f}s\n")
-        # Placeholder: metrics in `perf` can be exported using analysis/performance_eval.py.
+        print(f"[i] Server stopped. Total runtime: {uptime:.2f}s")
+
+        # Export metrics for offline analysis.
+        try:
+            # storage root already exists from file_ops.init_storage_root()
+            perf.to_csv(METRICS_FILE)
+            print(f"[i] Wrote performance metrics to {METRICS_FILE}\n")
+        except Exception as exc:
+            print(f"[x] Failed to write performance metrics: {exc}\n")
 
     # Return False so main.py menu reloads.
     return False

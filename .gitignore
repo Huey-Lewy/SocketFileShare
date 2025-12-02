@@ -5,11 +5,15 @@
 # Server storage (runtime data, per-user directories, auth DB/keys)
 server/storage/
 
+# Client storage (runtime data, auth DB/keys)
+client/storage/
+
 # Performance logs / analysis outputs (generated metrics)
 analysis/*.csv
 analysis/*.json
 analysis/*.log
 analysis/*.txt
+client_metrics.csv
 
 # Temporary test files / transferred sample data
 uploads/
