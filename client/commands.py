@@ -12,7 +12,12 @@ from analysis.performance_eval import PerfRecorder, timed       # client-side me
 BUFFER = 64 * 1024   # 64KB buffer size for file transfer
 ENC = "utf-8"        # Encoding format for strings
 LINE_END = b"\n"     # Line ending byte sequence
-CLIENT_SECRET_KEY_FILE = "server/storage/database/auth_secret.key"  # Must match server's key file
+
+# Base paths for client-side storage and key (all state lives under client/)
+BASE_DIR = os.path.dirname(__file__)
+CLIENT_STORAGE_ROOT = os.path.join(BASE_DIR, "storage")
+CLIENT_DATABASE_DIR = os.path.join(CLIENT_STORAGE_ROOT, "database")
+CLIENT_SECRET_KEY_FILE = os.path.join(CLIENT_DATABASE_DIR, "auth_secret.key")
 
 #### Encryption helpers ####
 def _load_shared_key():
@@ -22,9 +27,10 @@ def _load_shared_key():
     Returns:
         bytes | None: Key bytes if available, otherwise None.
     """
+    # Client never generates this key; it must already be on disk.
     if not os.path.exists(CLIENT_SECRET_KEY_FILE):
         print(f"[auth] Shared key file '{CLIENT_SECRET_KEY_FILE}' not found.")
-        print("[auth] Copy this key file from the server host before running the client.")
+        print("[auth] Copy this key file from the server host into the client/storage/database/ directory.")
         return None
 
     with open(CLIENT_SECRET_KEY_FILE, "rb") as f:
@@ -68,6 +74,7 @@ def encrypt_payload(payload_dict):
         return None
 
     try:
+        # All auth/admin JSON -> bytes -> Fernet token.
         raw = json.dumps(payload_dict).encode(ENC)
         token = cipher.encrypt(raw)
         return token.decode(ENC)
@@ -85,11 +92,14 @@ class ClientSession:
       - Socket object and connection state
       - Authenticated username, user_id, and role
       - Client-side performance metrics
+      - Client-side storage paths for metrics
     """
 
     def __init__(self, ip, port):
+        # Target server address
         self.addr = (ip, port)              # Server (ip, port)
         self.sock = None                    # Active socket
+        # Locks keep reads/writes from overlapping across threads
         self._recv_lock = threading.Lock()  # Serialize reads
         self._send_lock = threading.Lock()  # Serialize writes
         self.connected = False              # TCP connection flag
@@ -99,34 +109,77 @@ class ClientSession:
         self.authenticated = False          # Auth status
         self.perf = PerfRecorder()          # Local performance recorder
 
+        # Client-side storage roots (under client/storage/)
+        self.client_storage_root = CLIENT_STORAGE_ROOT
+        self.user_storage_dir = None        # Filled after first successful auth
+
+    def _init_user_storage_dir(self):
+        """
+        Create and remember the per-user client storage directory.
+
+        Layout (relative to repo root, when running main.py):
+            client/storage/ID_<user_id>_<username>/
+        """
+        if not self.user_id or not self.username:
+            return None
+
+        # Make sure base client storage directory exists.
+        os.makedirs(self.client_storage_root, exist_ok=True)
+
+        folder_name = f"ID_{self.user_id}_{self.username}"
+        user_dir = os.path.join(self.client_storage_root, folder_name)
+        os.makedirs(user_dir, exist_ok=True)
+        self.user_storage_dir = user_dir
+        return user_dir
+
     #### Basic Helpers ####
     def _sendline(self, line):
         """
         Send a single line to the server, appending a newline.
         """
-        if not self.sock:
+        if self.sock is None:
             print("[!] No active connection.")
             return
         data = (line.rstrip("\n") + "\n").encode(ENC)
+        # Lock so that concurrent commands can't interleave bytes.
         with self._send_lock:
             self.sock.sendall(data)
-        # Placeholder: add client-side logging of outbound commands.
+
+        # Basic outbound logging for visibility (hide token bodies).
+        if line.startswith("AUTH "):
+            log_cmd = "AUTH <token>"
+        elif line.startswith("PASSWD "):
+            log_cmd = "PASSWD <token>"
+        elif line.startswith("ADMIN ") and " " in line:
+            # Only print the ADMIN subcommand, not the encrypted token
+            log_cmd = "ADMIN " + line.split(" ", 2)[1]
+        else:
+            log_cmd = line
+        print(f"[client >>] {log_cmd}")
 
     def _readline(self):
         """
         Read a single newline-terminated line from the server.
 
         Returns:
-            str | None: Line text without the newline, or None on EOF.
+            str | None: Line text without the newline, or None on EOF or timeout.
         """
-        if not self.sock:
+        if self.sock is None:
             return None
 
         buf = bytearray()
+        # Read one byte at a time so we can stop exactly on '\n'.
         with self._recv_lock:
             while True:
-                ch = self.sock.recv(1)
+                try:
+                    ch = self.sock.recv(1)
+                except socket.timeout:
+                    # No data within timeout; return None unless we already have some bytes.
+                    if not buf:
+                        return None
+                    break
                 if not ch:
+                    # Remote closed.
                     break
                 buf += ch
                 if ch == LINE_END:
@@ -135,8 +188,8 @@ class ClientSession:
         if not buf:
             return None
 
+        # Strip trailing '\n' and decode.
         return buf[:-1].decode(ENC, errors="replace")
-        # Placeholder: add timeout handling and more robust framing if needed.
 
     #### Connection Lifecycle ####
     def connect(self):
@@ -150,6 +203,7 @@ class ClientSession:
         try:
             print(f"[+] Connecting to {self.addr[0]}:{self.addr[1]} ...")
             self.sock.connect(self.addr)
+            # Short socket timeout for command/response style traffic.
             self.sock.settimeout(5)
             self.connected = True
             print("[i] TCP connection established.\n")
@@ -161,6 +215,7 @@ class ClientSession:
         except OSError as e:
             print(f"[x] Connection error: {e}")
 
+        # On any error, tear down any partial state.
         self.close()
         return False
 
@@ -193,13 +248,39 @@ class ClientSession:
                 print("[i] Connection closed.")
             except Exception:
                 pass
+
+        # Try to write out client-side metrics before resetting.
+        try:
+            # Decide where to write metrics:
+            # - If the user has authenticated, use their per-user folder under client/storage/.
+            # - If not, fall back to a generic CSV under client/storage/.
+            if self.user_storage_dir:
+                try:
+                    os.makedirs(self.user_storage_dir, exist_ok=True)
+                except OSError:
+                    # If this fails, fall back to generic storage root.
+                    self.user_storage_dir = None
+
+            if self.user_storage_dir:
+                metrics_path = os.path.join(self.user_storage_dir, "client_metrics.csv")
+            else:
+                os.makedirs(self.client_storage_root, exist_ok=True)
+                metrics_path = os.path.join(self.client_storage_root, "client_metrics.csv")
+
+            # Single CSV with all timing + transfer metrics for this run.
+            self.perf.to_csv(metrics_path)
+            print(f"[i] Wrote client performance metrics to {metrics_path}")
+        except Exception as exc:
+            print(f"[x] Failed to write client performance metrics: {exc}")
+
+        # Reset connection / auth state.
         self.sock = None
         self.connected = False
         self.authenticated = False
         self.username = None
         self.user_id = None
         self.role = None
-        # Placeholder: dump or summarize client-side metrics using self.perf.snapshot().
+        # Do not reset user_storage_dir/client_storage_root; those describe local disk layout.
 
     #### Authentication and account commands ####
     def auth(self, username, password):
@@ -219,6 +300,7 @@ class ClientSession:
             "password": password,
         }
 
+        # Build encrypted Fernet token containing username+password.
         token = encrypt_payload(payload)
         if token is None:
             print("[x] Could not build encrypted auth payload.")
@@ -250,9 +332,14 @@ class ClientSession:
             self.role = role
             self.user_id = user_id
             self.authenticated = True
+
+            # Create per-user client storage folder now that we know id and username.
+            self._init_user_storage_dir()
+
             print(f"[i] Authenticated as '{self.username}' (role={self.role}, id={self.user_id}).")
             return True
 
+        # Server error path.
         if len(parts) >= 2 and parts[0] == "ERR" and parts[1] == "AUTH":
             reason = " ".join(parts[2:]) if len(parts) > 2 else "unknown error"
             print(f"[x] Authentication failed: {reason}")
@@ -323,6 +410,7 @@ class ClientSession:
         if not self._check_admin("ADMIN ADDUSER"):
             return
 
+        # Password is passed inside encrypted token, not in plaintext line.
         payload = {
             "op": "adduser",
             "password": password,
@@ -474,7 +562,7 @@ class ClientSession:
             # Each line: "<username> <role> <user_id>"
             print(f"  {line}")
 
-    #### File and directory commands (left for teammates) ####
+    #### File and directory commands ####
     def dir_list(self, path=None):
         """
         Request a directory listing from the server via the DIR command.
@@ -483,18 +571,39 @@ class ClientSession:
             print("[!] Authenticate before using DIR.")
             return
 
-        line = "DIR" if not path else f"DIR {path}"
+        # Empty path or "." means root of user's remote storage.
+        if path is None or path == ".":
+            line = "DIR"
+        else:
+            line = f"DIR {path}"
+
         timer = timed()
         self._sendline(line)
         resp = self._readline()
         duration = timer()
         self.perf.record_response(operation="dir", seconds=duration, source="client")
 
-        # Placeholder: handle listing output (single or multiple lines).
         if resp is None:
             print("[x] No response for DIR.")
             return
-        print(f"[server] {resp}")
+
+        if resp.startswith("ERR"):
+            print(f"[server] {resp}")
+            return
+
+        # Multi-line listing framed by BEGIN/END from server.
+        if resp == "BEGIN":
+            print("Directory listing:")
+            while True:
+                line = self._readline()
+                if line is None:
+                    print("[x] Server closed connection unexpectedly.")
+                    break
+                if line.strip() == "END":
+                    break
+                print(f"  {line}")
+        else:
+            print(f"[server] {resp}")
 
     def delete(self, remote_path):
         """
@@ -510,7 +619,6 @@ class ClientSession:
         duration = timer()
         self.perf.record_response(operation="delete", seconds=duration, source="client")
 
-        # Placeholder: handle server confirmation or error.
         if resp is None:
             print("[x] No response for DELETE.")
             return
@@ -535,7 +643,6 @@ class ClientSession:
         duration = timer()
         self.perf.record_response(operation="subfolder", seconds=duration, source="client")
 
-        # Placeholder: handle server confirmation.
         if resp is None:
             print("[x] No response for SUBFOLDER.")
             return
@@ -549,26 +656,101 @@ class ClientSession:
             print("[!] Authenticate before using UPLOAD.")
             return
 
+        if not os.path.exists(local_path):
+            print(f"[x] Local file '{local_path}' not found.")
+            return
         if not os.path.isfile(local_path):
-            print("[x] Local file not found.")
+            print(f"[x] '{local_path}' is not a file.")
+            return
+
+        if not self.connected or self.sock is None:
+            print("[!] Not connected; cannot upload.")
             return
 
         filename = remote_name if remote_name else os.path.basename(local_path)
-        size = os.path.getsize(local_path)
-        print(f"[!] Upload handler not implemented yet. Requested file: {filename} ({size} bytes).")
+        file_size = os.path.getsize(local_path)
 
-        timer = timed()
-        self._sendline(f"UPLOAD {filename} {size}")
-        # Placeholder: send file data in chunks using BUFFER or similar.
-        resp = self._readline()
-        duration = timer()
-        self.perf.record_transfer(operation="upload", bytes_count=size, seconds=duration, source="client")
+        # Protocol: UPLOAD <filename> <size>
+        print(f"[i] Requesting upload: {filename} ({file_size} bytes)...")
+        self._sendline(f"UPLOAD {filename} {file_size}")
 
-        # Placeholder: handle server upload status.
-        if resp is None:
-            print("[x] No response for UPLOAD.")
+        # Handshake: may see READY or EXISTS UPLOAD <path> or ERR ...
+        try:
+            resp = self._readline()
+            if resp is None:
+                print("[x] Connection closed by server during handshake.")
+                return
+
+            # Optional overwrite negotiation (if server implements it).
+            if resp.startswith("EXISTS UPLOAD"):
+                print(f"[server] {resp}")
+                choice = input("File exists on server. Overwrite? [y/N]: ").strip().lower()
+                if choice not in ("y", "yes"):
+                    self._sendline("SKIP")
+                    final = self._readline()
+                    if final is not None:
+                        print(f"[server] {final}")
+                    else:
+                        print("[x] No response after SKIP.")
+                    return
+
+                self._sendline("OVERWRITE")
+                resp = self._readline()
+                if resp is None:
+                    print("[x] No response after OVERWRITE.")
+                    return
+
+            # At this point we expect READY.
+            if resp == "READY":
+                pass
+            else:
+                if resp.startswith("ERR"):
+                    print(f"[x] Server rejected upload request. Reason: {resp}")
+                else:
+                    print(f"[x] Unexpected upload response: {resp}")
+                return
+
+        except Exception as e:
+            print(f"[x] Error during handshake: {e}")
             return
-        print(f"[server] {resp}")
+
+        # Start data transfer loop: stream file contents in BUFFER chunks.
+        print("[i] Sending file data...")
+        timer = timed()
+        sent_bytes = 0
+
+        try:
+            with open(local_path, "rb") as f:
+                while True:
+                    chunk = f.read(BUFFER)
+                    if not chunk:
+                        break
+                    with self._send_lock:
+                        self.sock.sendall(chunk)
+                    sent_bytes += len(chunk)
+
+            duration = timer()
+            self.perf.record_transfer(
+                operation="upload",
+                bytes_count=sent_bytes,
+                seconds=duration,
+                source="client",
+            )
+
+            if sent_bytes != file_size:
+                print(f"[!] Warning: File size changed during upload. Sent {sent_bytes}/{file_size}.")
+
+            # Wait for final ACK from server.
+            final_resp = self._readline()
+            if final_resp and final_resp.startswith("OK"):
+                print(f"[i] Upload complete. Server response: {final_resp}")
+            else:
+                print(f"[x] Upload may have failed. Server response: {final_resp}")
+        except OSError as e:
+            print(f"[x] Network error during transmission: {e}")
+            self.close()
+        except Exception as e:
+            print(f"[x] Unexpected error: {e}")
 
     def download(self, remote_name, local_path=None):
         """
@@ -578,19 +760,61 @@ class ClientSession:
             print("[!] Authenticate before using DOWNLOAD.")
             return
 
+        if not self.connected or self.sock is None:
+            print("[!] Not connected; cannot download.")
+            return
+
+        # Default: save to same filename locally if no override provided.
         local_target = local_path if local_path else remote_name
-        print(f"[!] Download handler not implemented yet. Requested file: {remote_name}.")
 
         timer = timed()
         self._sendline(f"DOWNLOAD {remote_name}")
-        # Placeholder: receive file size and file data, write to local_target.
         resp = self._readline()
-        duration = timer()
-        # Placeholder: replace bytes_count=0 with actual file size once implemented.
-        self.perf.record_transfer(operation="download", bytes_count=0, seconds=duration, source="client")
 
-        # Placeholder: handle server download status.
         if resp is None:
             print("[x] No response for DOWNLOAD.")
             return
-        print(f"[server] {resp}")
+
+        parts = resp.split()
+        if len(parts) != 2 or parts[0] != "SIZE":
+            print(f"[x] Server rejected download. Response: {resp}")
+            return
+
+        try:
+            file_size = int(parts[1])
+        except ValueError:
+            print(f"[x] Invalid file size received: {parts[1]}")
+            return
+
+        print(f"[i] Receiving '{remote_name}' ({file_size} bytes) to '{local_target}'...")
+
+        # Tell server we are ready to receive.
+        self._sendline("READY")
+
+        received_bytes = 0
+
+        try:
+            with open(local_target, "wb") as f:
+                while received_bytes < file_size:
+                    to_read = min(BUFFER, file_size - received_bytes)
+                    chunk = self.sock.recv(to_read)
+                    if not chunk:
+                        print("[x] Connection closed by server mid-transfer.")
+                        break
+                    f.write(chunk)
+                    received_bytes += len(chunk)
+
+            duration = timer()
+            self.perf.record_transfer(
+                operation="download",
+                bytes_count=received_bytes,
+                seconds=duration,
+                source="client",
+            )
+
+            if received_bytes == file_size:
+                print(f"[i] Download complete: {received_bytes} bytes written.")
+            else:
+                print(f"[x] Download incomplete. Expected {file_size} bytes, received {received_bytes} bytes.")
+        except Exception as e:
+            print(f"[x] Error receiving or writing file: {e}")

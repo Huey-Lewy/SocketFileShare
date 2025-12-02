@@ -20,6 +20,12 @@ DATABASE_ROOT = os.path.join(STORAGE_ROOT, "database")
 USER_DB = os.path.join(DATABASE_ROOT, "server_users.json")
 SECRET_KEY_FILE = os.path.join(DATABASE_ROOT, "auth_secret.key")
 
+# Project root and client-side locations for the shared key copy.
+PROJECT_ROOT = os.path.dirname(BASE_DIR)
+CLIENT_STORAGE_ROOT = os.path.join(PROJECT_ROOT, "client", "storage")
+CLIENT_DATABASE_ROOT = os.path.join(CLIENT_STORAGE_ROOT, "database")
+CLIENT_SECRET_KEY_FILE = os.path.join(CLIENT_DATABASE_ROOT, "auth_secret.key")
+
 ENCODING = "utf-8"
 
 # Password hashing parameters (PBKDF2-HMAC with SHA-256)
@@ -158,8 +164,21 @@ def _load_or_create_secret_key():
 
         print(f"[auth] Creating new auth secret key: {SECRET_KEY_FILE}")
         key = Fernet.generate_key()
+
+        # Write server copy
         with open(SECRET_KEY_FILE, "wb") as f:
             f.write(key)
+
+        # Try to write a client-side copy under client/storage/database/.
+        try:
+            os.makedirs(CLIENT_DATABASE_ROOT, exist_ok=True)
+            with open(CLIENT_SECRET_KEY_FILE, "wb") as cf:
+                cf.write(key)
+            print(f"[auth] Wrote client key copy to {CLIENT_SECRET_KEY_FILE}")
+        except OSError as exc:
+            # Do not block server startup if client copy fails.
+            print(f"[auth] Could not write client key copy: {exc}")
+
         return key
 
 def _get_cipher():
