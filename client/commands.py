@@ -104,7 +104,7 @@ class ClientSession:
         """
         Send a single line to the server, appending a newline.
         """
-        if not self.sock:
+        if self.sock is None:
             print("[!] No active connection.")
             return
         data = (line.rstrip("\n") + "\n").encode(ENC)
@@ -119,7 +119,7 @@ class ClientSession:
         Returns:
             str | None: Line text without the newline, or None on EOF.
         """
-        if not self.sock:
+        if self.sock is None:
             return None
 
         buf = bytearray()
@@ -556,6 +556,10 @@ class ClientSession:
             print(f"[x] '{local_path}' is not a file.")
             return
 
+        if not self.connected or self.sock is None:
+            print("[!] Not connected; cannot upload.")
+            return
+
         filename = remote_name if remote_name else os.path.basename(local_path)
         file_size = os.path.getsize(local_path)
 
@@ -620,6 +624,10 @@ class ClientSession:
         """
         if not self.authenticated:
             print("[!] Authenticate before using DOWNLOAD.")
+            return
+
+        if not self.connected or self.sock is None:
+            print("[!] Not connected; cannot download.")
             return
 
         local_target = local_path if local_path else remote_name
