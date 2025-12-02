@@ -549,26 +549,70 @@ class ClientSession:
             print("[!] Authenticate before using UPLOAD.")
             return
 
+        if not os.path.exists(local_path):
+            print(f"[x] Local file '{local_path}' not found.")
+            return
         if not os.path.isfile(local_path):
-            print("[x] Local file not found.")
+            print(f"[x] '{local_path}' is not a file.")
             return
 
         filename = remote_name if remote_name else os.path.basename(local_path)
-        size = os.path.getsize(local_path)
-        print(f"[!] Upload handler not implemented yet. Requested file: {filename} ({size} bytes).")
+        file_size = os.path.getsize(local_path)
 
-        timer = timed()
-        self._sendline(f"UPLOAD {filename} {size}")
-        # Placeholder: send file data in chunks using BUFFER or similar.
-        resp = self._readline()
-        duration = timer()
-        self.perf.record_transfer(operation="upload", bytes_count=size, seconds=duration, source="client")
+        # Protocol: UPLOAD <filename> <size>
+        print(f"[i] Requesting upload: {filename} ({file_size} bytes)...")
+        self._sendline(f"UPLOAD {filename} {file_size}")
 
-        # Placeholder: handle server upload status.
-        if resp is None:
-            print("[x] No response for UPLOAD.")
+        # Handle handshake
+        try:
+            resp = self._readline()
+            if resp is None:
+                print("[x] Connection closed by server during handshake.")
+                return
+            if resp != "READY":
+                print(f"[x] Server rejected upload request. Reason: {resp}")
+                return
+        except Exception as e:
+            print(f"[x] Error during handshake: {e}")
             return
-        print(f"[server] {resp}")
+
+        # Start data transfer
+        print("[i] Sending file data...")
+        timer = timed()
+        sent_bytes = 0
+
+        try:
+            with open(local_path, "rb") as f:
+                while True:
+                    chunk = f.read(BUFFER)
+                    if not chunk:
+                        break
+                    with self._send_lock:
+                        self.sock.sendall(chunk)
+                    sent_bytes += len(chunk)
+
+            duration = timer()
+            self.perf.record_transfer(
+                operation="upload",
+                bytes_count=sent_bytes,
+                seconds=duration,
+                source="client",
+            )
+
+            if sent_bytes != file_size:
+                print(f"[!] Warning: File size changed during upload. Sent {sent_bytes}/{file_size}.")
+
+            # Wait for final ACK
+            final_resp = self._readline()
+            if final_resp and final_resp.startswith("OK"):
+                print(f"[i] Upload complete. Server response: {final_resp}")
+            else:
+                print(f"[x] Upload may have failed. Server response: {final_resp}")
+        except OSError as e:
+            print(f"[x] Network error during transmission: {e}")
+            self.close()
+        except Exception as e:
+            print(f"[x] Unexpected error: {e}")
 
     def download(self, remote_name, local_path=None):
         """
@@ -579,18 +623,54 @@ class ClientSession:
             return
 
         local_target = local_path if local_path else remote_name
-        print(f"[!] Download handler not implemented yet. Requested file: {remote_name}.")
 
         timer = timed()
         self._sendline(f"DOWNLOAD {remote_name}")
-        # Placeholder: receive file size and file data, write to local_target.
         resp = self._readline()
-        duration = timer()
-        # Placeholder: replace bytes_count=0 with actual file size once implemented.
-        self.perf.record_transfer(operation="download", bytes_count=0, seconds=duration, source="client")
 
-        # Placeholder: handle server download status.
         if resp is None:
             print("[x] No response for DOWNLOAD.")
             return
-        print(f"[server] {resp}")
+
+        parts = resp.split()
+        if len(parts) != 2 or parts[0] != "SIZE":
+            print(f"[x] Server rejected download. Response: {resp}")
+            return
+
+        try:
+            file_size = int(parts[1])
+        except ValueError:
+            print(f"[x] Invalid file size received: {parts[1]}")
+            return
+
+        print(f"[i] Receiving '{remote_name}' ({file_size} bytes) to '{local_target}'...")
+
+        self._sendline("READY")
+
+        received_bytes = 0
+
+        try:
+            with open(local_target, "wb") as f:
+                while received_bytes < file_size:
+                    to_read = min(BUFFER, file_size - received_bytes)
+                    chunk = self.sock.recv(to_read)
+                    if not chunk:
+                        print("[x] Connection closed by server mid-transfer.")
+                        break
+                    f.write(chunk)
+                    received_bytes += len(chunk)
+
+            duration = timer()
+            self.perf.record_transfer(
+                operation="download",
+                bytes_count=received_bytes,
+                seconds=duration,
+                source="client",
+            )
+
+            if received_bytes == file_size:
+                print(f"[i] Download complete: {received_bytes} bytes written.")
+            else:
+                print(f"[x] Download incomplete. Expected {file_size} bytes, received {received_bytes} bytes.")
+        except Exception as e:
+            print(f"[x] Error receiving or writing file: {e}")

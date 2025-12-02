@@ -107,7 +107,7 @@ def resolve_path(session, rel_path):
 
 def _send_line(conn, text):
     """
-    Send a single line to the client, appending '\\n'.
+    Send a single line to the client, appending '\n'.
 
     Parameters:
         conn: Socket-like object (has sendall()).
@@ -131,6 +131,7 @@ def handle_upload(session, line, perf):
     The actual file data transfer will be implemented by teammates.
     """
     timer = timed()  # measure upload handling time
+    received_bytes = 0
 
     try:
         # Enforce that only authenticated clients can upload files.
@@ -145,12 +146,13 @@ def handle_upload(session, line, perf):
             print("[UPLOAD] failed: bad syntax")
             return
 
+        # Expected format: UPLOAD <remote_path> <size_bytes>
         _, rel_path, size_str = parts[0], parts[1], parts[2]
 
         # Validate and parse the size field.
         try:
-            size = int(size_str)
-            if size < 0:
+            file_size = int(size_str)
+            if file_size < 0:
                 raise ValueError
         except ValueError:
             _send_line(session.conn, "ERR UPLOAD Invalid size")
@@ -165,23 +167,43 @@ def handle_upload(session, line, perf):
             print(f"[UPLOAD] failed: invalid path '{rel_path}'")
             return
 
-        # At this point, we have:
-        #   - target_path: where the file should be stored
-        #   - size: total expected bytes to receive
-        print(f"[UPLOAD] stub: {rel_path} -> {target_path} ({size} bytes)")
+        # Create parent directories if needed.
+        parent_dir = os.path.dirname(target_path)
+        _make_dirs(parent_dir)
 
-        # Placeholder: check if target_path already exists and ask client about overwrite.
-        # Placeholder: receive exactly <size> bytes from session.conn in CHUNK_SIZE chunks.
-        # Placeholder: write received bytes to target_path.
-        # Placeholder: send success or error response after write completes.
-        # Placeholder: record upload status in any higher-level reporting if desired.
+        print(f"[UPLOAD] Starting: {rel_path} ({file_size} bytes) -> {target_path}")
 
-        _send_line(session.conn, "ERR UPLOAD Not implemented")
+        # Send READY so client can start streaming bytes.
+        _send_line(session.conn, "READY")
+
+        try:
+            with open(target_path, "wb") as f:
+                # Receive exactly file_size bytes from the client.
+                while received_bytes < file_size:
+                    remaining = file_size - received_bytes
+                    to_read = min(CHUNK_SIZE, remaining)
+                    chunk = session.conn.recv(to_read)
+                    if not chunk:
+                        raise ConnectionResetError("Connection lost during transfer")
+                    f.write(chunk)
+                    received_bytes += len(chunk)
+
+            _send_line(session.conn, f"OK UPLOAD {rel_path}")
+            print(f"[UPLOAD] Finished. {rel_path} uploaded by {session.username}")
+        except OSError as e:
+            print(f"[UPLOAD] File IO error: {e}")
+            _send_line(session.conn, f"ERR UPLOAD Server disk error: {e}")
+        except Exception as e:
+            print(f"[UPLOAD] Transfer error: {e}")
+            _send_line(session.conn, "ERR UPLOAD Transfer interrupted")
+
+    except Exception as e:
+        print(f"[UPLOAD] Critical error: {e}")
+        _send_line(session.conn, "ERR UPLOAD Internal error")
 
     finally:
         elapsed = timer()
-        # Placeholder: replace bytes_count=0 with the actual number of bytes written.
-        perf.record_transfer(operation="upload", bytes_count=0, seconds=elapsed, source="server")
+        perf.record_transfer(operation="upload", bytes_count=received_bytes, seconds=elapsed, source="server")
 
 def handle_download(session, line, perf):
     """
@@ -196,6 +218,7 @@ def handle_download(session, line, perf):
     The actual file streaming logic will be implemented by teammates.
     """
     timer = timed()  # measure download handling time
+    sent_bytes = 0
 
     try:
         # Enforce that only authenticated clients can download files.
@@ -220,21 +243,47 @@ def handle_download(session, line, perf):
             print(f"[DOWNLOAD] failed: invalid path '{rel_path}'")
             return
 
-        print(f"[DOWNLOAD] stub: {rel_path} -> {target_path}")
+        if not os.path.isfile(target_path):
+            _send_line(session.conn, "ERR DOWNLOAD File not found")
+            print(f"[DOWNLOAD] failed: file not found at {target_path}")
+            return
 
-        # Placeholder: check if target_path exists.
-        # Placeholder: send error response if file does not exist.
-        # Placeholder: send file size first.
-        # Placeholder: stream file contents from disk to client in CHUNK_SIZE chunks.
-        # Placeholder: handle broken connections and partial sends.
-        # Placeholder: record download status in any higher-level reporting if desired.
+        file_size = os.path.getsize(target_path)
 
-        _send_line(session.conn, "ERR DOWNLOAD Not implemented")
+        print(f"[DOWNLOAD] Preparing to send: {rel_path} ({file_size} bytes)...")
+
+        # Send size header: "SIZE <file_size>"
+        _send_line(session.conn, f"SIZE {file_size}")
+
+        # Wait for client READY
+        try:
+            resp = session.conn.recv(1024).decode(ENC).strip()
+            if resp != "READY":
+                print(f"[DOWNLOAD] Client rejected transfer or sent unexpected response: {resp}")
+                return
+        except Exception:
+            print("[DOWNLOAD] Client disconnected or failed READY response.")
+            return
+
+        try:
+            with open(target_path, "rb") as f:
+                while True:
+                    chunk = f.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    session.conn.sendall(chunk)
+                    sent_bytes += len(chunk)
+
+            if sent_bytes == file_size:
+                print(f"[DOWNLOAD] Success: {sent_bytes} bytes sent for '{rel_path}'")
+            else:
+                print(f"[DOWNLOAD] Size mismatch. Expected {file_size}, sent {sent_bytes}.")
+        except Exception as e:
+            print(f"[DOWNLOAD] Error: {e}")
 
     finally:
         elapsed = timer()
-        # Placeholder: replace bytes_count=0 with the actual number of bytes sent.
-        perf.record_transfer(operation="download", bytes_count=0, seconds=elapsed, source="server")
+        perf.record_transfer(operation="download", bytes_count=sent_bytes, seconds=elapsed, source="server")
 
 def handle_delete(session, line, perf):
     """
