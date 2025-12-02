@@ -12,7 +12,7 @@ from analysis.performance_eval import PerfRecorder, timed       # client-side me
 BUFFER = 64 * 1024   # 64KB buffer size for file transfer
 ENC = "utf-8"        # Encoding format for strings
 LINE_END = b"\n"     # Line ending byte sequence
-CLIENT_SECRET_KEY_FILE = "auth_secret.key"  # Must match server's key file
+CLIENT_SECRET_KEY_FILE = "server/storage/database/auth_secret.key"  # Must match server's key file
 
 #### Encryption helpers ####
 def _load_shared_key():
