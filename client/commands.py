@@ -19,6 +19,9 @@ CLIENT_STORAGE_ROOT = os.path.join(BASE_DIR, "storage")
 CLIENT_DATABASE_DIR = os.path.join(CLIENT_STORAGE_ROOT, "database")
 CLIENT_SECRET_KEY_FILE = os.path.join(CLIENT_DATABASE_DIR, "auth_secret.key")
 
+# All downloads are stored under client/downloads/
+CLIENT_DOWNLOADS_DIR = os.path.join(BASE_DIR, "downloads")
+
 #### Encryption helpers ####
 def _load_shared_key():
     """
@@ -131,6 +134,96 @@ class ClientSession:
         os.makedirs(user_dir, exist_ok=True)
         self.user_storage_dir = user_dir
         return user_dir
+
+    def _resolve_local_upload(self, local_path):
+        """
+        Resolve which local file to upload.
+
+        Rules:
+          - If local_path includes a path separator, treat it as an explicit path.
+          - If it's just a filename, search:
+              1) current working directory
+              2) per-user client storage dir (if it exists)
+        If multiple matches are found, prompt the user to choose one.
+        """
+        # Explicit path: just check and use it.
+        if os.sep in local_path or "/" in local_path:
+            if os.path.isfile(local_path):
+                resolved = os.path.abspath(local_path)
+                print(f"[i] Using local file: {resolved}")
+                return resolved
+            print(f"[x] Local file '{local_path}' not found.")
+            return None
+
+        # Bare filename: search in known roots.
+        candidates = []
+
+        # 1) Current working directory (project root when running main.py)
+        cwd_candidate = os.path.join(os.getcwd(), local_path)
+        if os.path.isfile(cwd_candidate):
+            candidates.append(cwd_candidate)
+
+        # 2) Per-user client storage directory (client/storage/ID_<id>_<username>/)
+        if self.user_storage_dir:
+            user_candidate = os.path.join(self.user_storage_dir, local_path)
+            if os.path.isfile(user_candidate) and user_candidate not in candidates:
+                candidates.append(user_candidate)
+
+        if not candidates:
+            print(f"[x] Local file '{local_path}' not found in current directory or client storage.")
+            return None
+
+        if len(candidates) == 1:
+            resolved = os.path.abspath(candidates[0])
+            print(f"[i] Using local file: {resolved}")
+            return resolved
+
+        # Multiple matches: ask which one to use.
+        print(f"[?] Multiple matches for '{local_path}':")
+        for idx, path in enumerate(candidates, start=1):
+            print(f"  [{idx}] {path}")
+
+        choice = input(f"Select file to upload [1-{len(candidates)} or 'c' to cancel]: ").strip().lower()
+        if choice in ("c", "q", "quit", "cancel"):
+            print("[i] Upload cancelled.")
+            return None
+
+        try:
+            idx = int(choice)
+        except ValueError:
+            print("[x] Invalid selection; upload cancelled.")
+            return None
+
+        if not (1 <= idx <= len(candidates)):
+            print("[x] Selection out of range; upload cancelled.")
+            return None
+
+        resolved = os.path.abspath(candidates[idx - 1])
+        print(f"[i] Using local file: {resolved}")
+        return resolved
+
+    def _resolve_download_target(self, remote_name, local_override=None):
+        """
+        Decide where to store a downloaded file locally.
+
+        All downloads are placed under client/downloads/.
+        If local_override is given, only its basename is used.
+        """
+        if local_override:
+            filename = os.path.basename(local_override)
+        else:
+            filename = os.path.basename(remote_name)
+
+        if not filename:
+            filename = "downloaded_file"
+
+        try:
+            os.makedirs(CLIENT_DOWNLOADS_DIR, exist_ok=True)
+        except OSError as exc:
+            print(f"[x] Could not create local downloads directory '{CLIENT_DOWNLOADS_DIR}': {exc}")
+            return None
+
+        return os.path.join(CLIENT_DOWNLOADS_DIR, filename)
 
     #### Basic Helpers ####
     def _sendline(self, line):
@@ -656,19 +749,17 @@ class ClientSession:
             print("[!] Authenticate before using UPLOAD.")
             return
 
-        if not os.path.exists(local_path):
-            print(f"[x] Local file '{local_path}' not found.")
-            return
-        if not os.path.isfile(local_path):
-            print(f"[x] '{local_path}' is not a file.")
-            return
-
         if not self.connected or self.sock is None:
             print("[!] Not connected; cannot upload.")
             return
 
-        filename = remote_name if remote_name else os.path.basename(local_path)
-        file_size = os.path.getsize(local_path)
+        # Resolve which local file to use (handles duplicates & prompts).
+        resolved_local = self._resolve_local_upload(local_path)
+        if resolved_local is None:
+            return
+
+        filename = remote_name if remote_name else os.path.basename(resolved_local)
+        file_size = os.path.getsize(resolved_local)
 
         # Protocol: UPLOAD <filename> <size>
         print(f"[i] Requesting upload: {filename} ({file_size} bytes)...")
@@ -720,7 +811,7 @@ class ClientSession:
         sent_bytes = 0
 
         try:
-            with open(local_path, "rb") as f:
+            with open(resolved_local, "rb") as f:
                 while True:
                     chunk = f.read(BUFFER)
                     if not chunk:
@@ -764,9 +855,6 @@ class ClientSession:
             print("[!] Not connected; cannot download.")
             return
 
-        # Default: save to same filename locally if no override provided.
-        local_target = local_path if local_path else remote_name
-
         timer = timed()
         self._sendline(f"DOWNLOAD {remote_name}")
         resp = self._readline()
@@ -786,9 +874,25 @@ class ClientSession:
             print(f"[x] Invalid file size received: {parts[1]}")
             return
 
+        # Decide where to save the file locally (always under client/downloads/)
+        local_target = self._resolve_download_target(remote_name, local_path)
+        if local_target is None:
+            # Cannot create downloads directory; politely decline.
+            self._sendline("SKIP")
+            return
+
         print(f"[i] Receiving '{remote_name}' ({file_size} bytes) to '{local_target}'...")
 
-        # Tell server we are ready to receive.
+        # If the file already exists, confirm overwrite.
+        if os.path.exists(local_target):
+            choice = input(f"[?] Local file '{local_target}' already exists. Overwrite? [y/N]: ").strip().lower()
+            if choice not in ("y", "yes"):
+                print("[i] Download cancelled; existing file left untouched.")
+                # Tell server we're not going to receive this file.
+                self._sendline("SKIP")
+                return
+
+        # Tell server we are ready to receive the bytes.
         self._sendline("READY")
 
         received_bytes = 0

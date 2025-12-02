@@ -60,6 +60,34 @@ From the client prompt, type `help` to see all available commands, including:
 * Admin-only commands (when logged in as admin)
 * Session control: `quit`, `exit`
 
+**File path behavior**
+
+* `upload <local_path> [remote]`
+
+  * If `<local_path>` contains a path (e.g. `some/folder/file.mp4`), it’s used directly.
+  * If it’s just a filename (e.g. `Cat.mp4`), the client searches:
+
+    * the current working directory (project root when running `main.py`)
+    * `client/storage/ID_<user_id>_<username>/`
+  * If the same filename exists in multiple locations, the client asks which one to use.
+  * If the remote file already exists, the client asks before overwriting.
+
+* `download <remote> [local_name]`
+
+  * All downloads go to `client/downloads/`.
+  * If `[local_name]` is provided, its basename becomes the filename in `client/downloads/`.
+  * If the target file already exists, the client asks before overwriting.
+
+### Client storage layout
+
+Everything client-side lives under `client/`:
+
+* `client/storage/database/auth_secret.key` – shared Fernet auth key
+* `client/storage/ID_<user_id>_<username>/` – per-user storage (optional local copies, metrics)
+* `client/downloads/` – all downloaded files
+
+You can move/copy `client/` as a self-contained client bundle.
+
 ## Features
 
 * Multithreaded TCP server (multiple clients at once)
@@ -93,5 +121,7 @@ SocketFileShare/
 ```
 
 Generated at runtime (not tracked in git):
-* `server/storage/` – per-user files, user DB, key file, server metrics
-* `client_metrics.csv` – client-side performance metrics
+
+* `server/storage/`: per-user files, user DB, key file, server metrics
+* `client/storage/ID_<user_id>_<username>/client_metrics.csv`: per-user client performance metrics
+* `client/downloads/`: downloaded files from the server

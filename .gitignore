@@ -37,6 +37,7 @@ secrets.json
 # System-specific hidden files
 .DS_Store
 Thumbs.db
+desktop.ini
 
 #### (Legacy) Ignored server files ####
 # (Legacy) Server logs (if logging is re-added later, not required)
