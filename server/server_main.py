@@ -2,6 +2,7 @@
 # Starts the multithreaded server application and dispatches client commands.
 
 import os                           # paths for metrics export
+import sys                          # process exit handling
 import socket                       # TCP server sockets
 import threading                    # per-client threads
 from cryptography.fernet import InvalidToken      # decrypt error type for PASSWD/ADMIN
@@ -107,13 +108,36 @@ def _recv_line(conn, max_bytes=4096):
     line, _, _ = buf.partition(b"\n")
     return line.decode(ENC, errors="replace").strip()
 
-
 def _send_line(conn, text):
     """
     Send a single line to the client, appending '\n'.
     """
     data = (text.rstrip("\n") + "\n").encode(ENC)
     conn.sendall(data)
+
+def _console_shutdown_loop(stop_event):
+    """
+    Background console loop for server shutdown.
+
+    Typing 'q' and pressing Enter will ask for confirmation and,
+    if confirmed, set stop_event so the main listener loop can
+    exit cleanly and write metrics.
+    """
+    while not stop_event.is_set():
+        try:
+            cmd = input().strip().lower()
+        except EOFError:
+            # Input stream closed; nothing else we can do.
+            return
+
+        if cmd == "q":
+            confirm = input("Shut down server and write metrics? [y/N]: ").strip().lower()
+            if confirm in ("y", "yes"):
+                print("[i] Shutdown requested. Stopping server...")
+                stop_event.set()
+                return
+            else:
+                print("[i] Shutdown cancelled. Server is still running.")
 
 #### Command helpers: PASSWD and ADMIN ####
 def _handle_self_passwd(session, line):
@@ -466,10 +490,11 @@ def main():
 
     Responsibilities:
       - Initialize auth store (user DB + secret key).
-      - Optionally init base storage paths exist.
+      - Init base storage paths.
       - Prompt for bind address and port.
       - Accept clients on a listening socket and spawn a thread per client.
       - Record total server uptime for performance analysis.
+      - Support graceful shutdown via 'q' + Enter from the console.
     """
     # Initialize authentication storage (user DB and secret key) before serving.
     auth.init_auth_store()
@@ -490,38 +515,63 @@ def main():
     try:
         server_sock.bind((host, port))
         server_sock.listen(BACKLOG)
-        server_sock.settimeout(1.0)  # Allows periodic interrupt checks
+        server_sock.settimeout(1.0)  # Allows periodic shutdown checks
     except OSError as exc:
         print(f"[x] Failed to start server: {exc}")
         return False
 
-    print(f"[✓] Server listening on {host}:{port}\nPress Ctrl+C to stop.\n")
+    print(
+        f"[✓] Server listening on {host}:{port}\n"
+        "Type 'q' and press Enter to stop the server.\n"
+    )
 
     start_timer = timed()  # track server uptime
 
+    # Event used to coordinate shutdown between console thread and accept loop.
+    shutdown_event = threading.Event()
+
+    # Start background console thread to watch for 'q'.
+    console_thread = threading.Thread(
+        target=_console_shutdown_loop,
+        args=(shutdown_event,),
+        daemon=True,
+    )
+    console_thread.start()
+
     try:
-        while True:
+        while not shutdown_event.is_set():
             try:
                 conn, addr = server_sock.accept()
-                # Spawn a new daemon thread for each client connection.
-                thread = threading.Thread(
-                    target=handle_client, args=(conn, addr), daemon=True
-                )
-                thread.start()
-
             except socket.timeout:
-                # Periodic timeout keeps this loop responsive to Ctrl+C.
+                # Timeout so we can re-check shutdown_event regularly.
                 continue
-
-            except KeyboardInterrupt:
-                print("\n[i] Stopping server...")
+            except OSError:
+                # Listening socket was closed; exit loop.
                 break
 
+            # Spawn a new daemon thread for each client connection.
+            thread = threading.Thread(
+                target=handle_client,
+                args=(conn, addr),
+                daemon=True,
+            )
+            thread.start()
+
     except KeyboardInterrupt:
-        print("\n[i] Server interrupted. Stopping...")
+        # Emergency Ctrl+C. Try to shut down cleanly anyway.
+        print("\n[i] Server interrupted via Ctrl+C. Stopping...")
+        shutdown_event.set()
 
     finally:
-        server_sock.close()
+        # Stop accepting new connections and unblock accept().
+        try:
+            server_sock.close()
+        except Exception:
+            pass
+
+        # Ensure the console thread (if still running) knows we're done.
+        shutdown_event.set()
+
         uptime = start_timer()
         perf.record_response(operation="server_uptime", seconds=uptime, source="server")
         print(f"[i] Server stopped. Total runtime: {uptime:.2f}s")

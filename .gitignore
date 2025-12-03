@@ -34,6 +34,11 @@ secrets.json
 *.gz
 *.zip
 
+# Common media files (usually used for upload/download testing)
+*.txt
+*.mp3
+*.mp4
+
 # System-specific hidden files
 .DS_Store
 Thumbs.db
